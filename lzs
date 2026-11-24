@@ -777,7 +777,7 @@ session's key: list and open its other sandboxes, restore its snapshots. Keep it
   const others = await otherMembers(project);
   if (others === null) say(`could not check who else can open project ${project.name}`);
   else if (others.length) {
-    warnLoud(`${plural(others.length, "other person", "other people")} can open project ${bold(project.name)} (${others.slice(0, 8).join(", ")}${others.length > 8 ? ", …" : ""}). They can restore your base snapshot, which holds your agent login, and open your sessions. lzs init --new-project makes a project of your own.`);
+    warnLoud(`${plural(others.length, "other person", "other people")} can open project ${bold(project.name)} (${others.slice(0, 8).join(", ")}${others.length > 8 ? ", …" : ""}). They can restore your base snapshot, which holds your agent login, and open your sessions. ${flags["new-project"] ? "They are members of its workspace: --workspace <one of your own> keeps them out." : "lzs init --new-project makes a project of your own."}`);
     if (rl && !/^y/i.test(await ask(rl, "build the base there anyway? [y/N] "))) die("nothing created");
   }
 
@@ -861,7 +861,7 @@ j.skipDangerousModePermissionPrompt=true;j.env={...(j.env||{}),DISABLE_AUTOUPDAT
     // The terminal carries the Lizard-connected logins: keep the agent ones in the base.
     const t = await terminalLine(id, `env | grep -E '^(${LOGIN_VARS})=' > ${REMOTE}/agent-env.raw; chmod 600 ${REMOTE}/agent-env.raw`);
     const r = remote(id, `cd ${REMOTE} && n=0; [ -f agent-env.raw ] && while IFS='=' read -r k v; do [ -n "$k" ] && printf '%s=%q\\n' "$k" "$v" >> agent.env && n=$((n+1)); done < agent-env.raw; rm -f agent-env.raw; echo $n`, { check: false });
-    if (!t.ok || !(Number(r.stdout.trim()) > 0)) say("could not read the logins connected on Lizard from the sandbox's terminal");
+    if (!t.ok || !(Number(r.stdout.trim()) > 0)) say(`no login came from Lizard for ${project.name}: logins connected on Lizard belong to one project (lizard agents -p ${project.name} add …, or the project's Agents page)`);
   }
   // Codex wants an API key as a login of its own.
   remote(id, `set -a; . ${REMOTE}/agent.env; set +a; [ -n "\${OPENAI_API_KEY:-}" ] && command -v codex >/dev/null && [ ! -s /root/.codex/auth.json ] && printenv OPENAI_API_KEY | codex login --with-api-key >/dev/null 2>&1; true`, { check: false });
