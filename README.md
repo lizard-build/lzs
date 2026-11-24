@@ -8,9 +8,12 @@ lizard login
 lzs init                         # once: your base snapshot (agent login, skills, MCPs)
 
 lzs .                            # this repo, uncommitted work included, in a fresh sandbox
-lzs fan 10 . -p "fix the flaky checkout test"   # ten agents on it, in the background
-lzs watch                        # who's working, who's done, who's asking; a bell when one needs you
-lzs pull lzs-3                   # the winner's work, back here as branch lzs/lzs-3
+
+# best of 5: five agents on one task, your tests run in each when it finishes
+lzs fan 5 . -p "fix the flaky checkout test" --check "npm test"
+lzs watch                        # who's working, who's done, whose tests pass
+lzs diff                         # the five side by side, passing ones first
+lzs pick lzs-3                   # keep that one as branch lzs/lzs-3, delete the other four
 ```
 
 Each session is its own [Lizard](https://lizard.build) sandbox:
@@ -18,6 +21,11 @@ Each session is its own [Lizard](https://lizard.build) sandbox:
 - **ready in ~3 s** with the agent already running: Claude Code, Codex or OpenCode
 - **your repo goes in as it is**: history, branch, uncommitted and untracked files. No push needed
 - **the work comes back as a git branch** (`lzs pull`), or as a pull request (`lzs push`)
+- **best of N**: `--check "npm test"` runs your tests in each sandbox when its agent finishes;
+  `lzs diff` ranks the attempts, `lzs pick` keeps the winner
+- **your phone buzzes when an agent is done**, laptop closed: `lzs init --notify <ntfy, Slack,
+  Discord or Telegram URL>`; the sandbox itself sends it, with the check result
+- **no token to paste** if you connected Claude on Lizard (`lizard agents login claude`)
 - **your setup comes along**: `~/.claude` CLAUDE.md, skills, agents, commands, MCP servers
 - **keeps going when your laptop sleeps**: the agent runs in tmux in the sandbox
 - **pauses itself when idle** (30 min): compute billing stops, files and the conversation stay
@@ -34,9 +42,10 @@ about $148, and less, because idle ones pause themselves. Egress is free.
 ```
 Start
   lzs init [--agent claude|codex|opencode] [--size nano|mini|small] [--github]
-           [--idle-minutes 30] [--project P] [--no-local]    build your base snapshot (once)
+           [--notify URL] [--idle-minutes 30] [--project P]  build your base snapshot (once)
   lzs [. | DIR | --repo owner/name] [-p "task"] [-d]         a fresh session (. = this repo)
-  lzs fan N [. | --repo owner/name] -p "task"                N agents on one task, in the background
+  lzs fan N [. | --repo owner/name] -p "task" [--check CMD]  N agents on one task; CMD (your tests)
+                                                             runs in each one when it finishes
   lzs group N [.] [-p "task"]                                N sessions side by side (inside tmux)
 
 Follow
@@ -45,6 +54,12 @@ Follow
   lzs peek <name>                                            its screen, without attaching
   lzs send <name> "text" | --all "text"                      type into the agent without attaching
   lzs resume [name]                                          attach (wakes a paused one)
+
+Compare
+  lzs diff                                                   the last fan-out side by side
+  lzs diff <name> [--stat]                                   one session's diff
+  lzs check [name...] [--check CMD]                          run the check now, everywhere at once
+  lzs pick <name>                                            keep it (as a branch), delete the rest
 
 Ship
   lzs pull <name>                                            the work as branch lzs/<name> in your repo
@@ -61,19 +76,21 @@ The terminal on lizard.build attaches to the same session.
 
 ```
 $ lzs ls
-lzs-1     working     claude   shop · Fix flaky checkout test · 2 commits
-lzs-2     your turn   claude   shop · Add retry to payment webhook · 3 changed · idle 4m
-lzs-3     asking you  codex    shop · Migrate orders table
-lzs-4     paused      claude   shop · write tests
+lzs-1     working     claude           shop · Fix flaky checkout test · +40 −12
+lzs-2     your turn   claude   ✓ check shop · Fix flaky checkout test · +18 −3 · idle 4m
+lzs-3     your turn   claude   ✗ check shop · Fix flaky checkout test · +95 −40
+lzs-4     paused      claude           shop · Add retry to payment webhook
 
 4 sessions · 3 running · ~$0.012/h (nano) · 2 waiting for you
 ```
 
 ## Signing in
 
-`lzs init` asks once and keeps the answers in your private base snapshot:
+`lzs init` keeps the agent's login in your private base snapshot. In order:
 
-- **Claude Code**: run `claude setup-token` on your machine and paste the token (or set
+- **Connected on Lizard**: if you connected Claude (or an API key) for the project with
+  `lizard agents login claude` or on the Agents page, `lzs init` takes it from there. Nothing to paste.
+- **Claude Code**: otherwise run `claude setup-token` on your machine and paste the token (or set
   `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`). One long-lived token is safe for many sessions
   at once; copying a normal login is not, because sessions refreshing it sign each other out.
 - **Codex**: `OPENAI_API_KEY`, or sign in by hand when `lzs init` opens the base shell.

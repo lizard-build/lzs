@@ -17,8 +17,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
+import { createRequire } from "node:module";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const HOME = os.homedir();
 const CFG_DIR = process.env.LZS_HOME || path.join(HOME, ".config", "lzs");
 const CFG_FILE = path.join(CFG_DIR, "config.json");
@@ -67,7 +68,9 @@ const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 const b64 = (s) => Buffer.from(s).toString("base64");
 const secs = (t0) => ((Date.now() - t0) / 1000).toFixed(1);
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
-const trunc = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
+const plain = (s) => String(s).replace(/\x1b\[[0-9;]*m/g, "");
+// Shorten to n visible characters; colored text that doesn't fit loses its colors.
+const trunc = (s, n) => { const p = plain(s); return p.length <= n ? s : p.slice(0, n - 1) + "…"; };
 
 function lizard(args, { json = false, input, inherit = false, check = true } = {}) {
   const full = json ? [...args, "--json"] : args;
@@ -102,6 +105,30 @@ const remoteAsync = (id, script, opts) => lizardAsync(["sandbox", "exec", id, "-
 
 const shell = (id) => spawnSync("lizard", ["sandbox", "ssh", id], { stdio: "inherit" }).status ?? 1;
 
+// Runs a line in the sandbox's terminal (the one lizard.build and `lizard sandbox ssh` open).
+// Unlike exec, that terminal starts with the agent logins you connected on Lizard (the
+// project's Agents page, or `lizard agents login claude`), so this is how a base picks them
+// up without you pasting anything. Uses the WebSocket client the lizard CLI ships with.
+async function terminalLine(id, line, timeoutMs = 20000) {
+  const bin = spawnSync(process.platform === "win32" ? "where" : "which", ["lizard"], { encoding: "utf8" }).stdout.trim().split("\n")[0];
+  const pkg = path.join(path.dirname(path.dirname(fs.realpathSync(bin))), "package.json");
+  const WebSocket = createRequire(pkg)("ws");
+  const lzCfg = readJson(path.join(process.env.LIZARD_HOME ? path.join(process.env.LIZARD_HOME, ".lizard") : path.join(HOME, ".lizard"), "config.json"), {});
+  const token = process.env.LIZARD_TOKEN || process.env.LIZARD_API_KEY || lzCfg.credentials?.accessToken;
+  if (!token) die("the lizard CLI is not signed in. Run: lizard login");
+  const base = new URL(process.env.LIZARD_API_URL || "https://lizard.build");
+  base.protocol = base.protocol === "http:" ? "ws:" : "wss:";
+  return new Promise((resolve) => {
+    const ws = new WebSocket(new URL(`/api/sandboxes/terminal?id=${encodeURIComponent(id)}`, base), { headers: { Authorization: `Bearer ${token}` } });
+    let sent = false, out = "";
+    const t = setTimeout(() => { try { ws.terminate(); } catch {} resolve({ ok: false, out }); }, timeoutMs);
+    ws.on("open", () => ws.send(JSON.stringify({ type: "resize", cols: 200, rows: 50 })));
+    ws.on("message", (d) => { out += d.toString(); if (!sent) { sent = true; setTimeout(() => ws.send(Buffer.from(` ${line}; exit\r`), { binary: true }), 300); } });
+    ws.on("close", () => { clearTimeout(t); resolve({ ok: sent, out }); });
+    ws.on("error", () => { clearTimeout(t); resolve({ ok: false, out }); });
+  });
+}
+
 async function pool(items, n, fn) {
   const out = new Array(items.length);
   let i = 0;
@@ -109,7 +136,7 @@ async function pool(items, n, fn) {
   return out;
 }
 
-const BOOL_FLAGS = new Set(["yes", "y", "no-attach", "detach", "d", "no-local", "github", "all", "json", "files", "help", "h", "version", "v"]);
+const BOOL_FLAGS = new Set(["yes", "y", "no-attach", "detach", "d", "no-local", "github", "all", "json", "files", "stat", "keep", "help", "h", "version", "v"]);
 function parse(argv) {
   const flags = {}, rest = [];
   let pass = [];
@@ -191,22 +218,62 @@ pkill -f "$L/watchdog.sh" 2>/dev/null
 setsid nohup $L/watchdog.sh >$L/watchdog.log 2>&1 </dev/null &
 `.replace(/\\\$\{/g, "${");
 
-// Pauses the sandbox itself once nothing has happened for LZS_IDLE_MINUTES: no change on the
-// agent's screen and no keystroke from anyone attached. Pausing keeps the files; billing stops.
+// The sandbox's own supervisor, so all of this works with your laptop closed:
+// - when the agent finishes a turn (its "esc to interrupt" goes away), run the session's check
+//   (your tests, say) and notify you (LZS_NOTIFY: ntfy, Slack, Discord or Telegram URL);
+// - once nothing has happened for LZS_IDLE_MINUTES (no change on the agent's screen, no keystroke
+//   from anyone attached), pause the sandbox. Pausing keeps the files; compute billing stops.
 const WATCHDOG_SH = String.raw`#!/bin/bash
 L=/root/.lzs
 [ -f $L/env ] && set -a && . $L/env && set +a
 idle_min="\${LZS_IDLE_MINUTES:-30}"
-[ "$idle_min" = 0 ] && exit 0
-last=$(date +%s); prev=""
-while sleep 30; do
+last=$(date +%s); prev=""; was=""; worked=0
+
+notify() { # $1 title, $2 text
+  local u="\${LZS_NOTIFY:-}"; [ -z "$u" ] && return 0
+  case "$u" in
+    *hooks.slack.com*) curl -fsS -m 10 -H 'Content-Type: application/json' -d "$(node -e 'console.log(JSON.stringify({text:process.argv[1]+"\n"+process.argv[2]}))' "$1" "$2")" "$u" ;;
+    *discord.com/api/webhooks*) curl -fsS -m 10 -H 'Content-Type: application/json' -d "$(node -e 'console.log(JSON.stringify({content:"**"+process.argv[1]+"**\n"+process.argv[2]}))' "$1" "$2")" "$u" ;;
+    *api.telegram.org*) curl -fsS -m 10 --data-urlencode "text=$1
+$2" "$u" ;;
+    *) curl -fsS -m 10 -H "Title: $1" -H "Tags: lizard" -d "$2" "$u" ;;
+  esac >/dev/null 2>&1
+}
+
+run_check() { # writes check.rc / check.log / check.at; returns the exit code
+  [ -s $L/check ] || return 0
+  echo running > $L/check.rc
+  ( cd "$(cat $L/cwd 2>/dev/null || echo /workspace)" && timeout "\${LZS_CHECK_TIMEOUT:-900}" bash -lc "$(cat $L/check)" ) > $L/check.log 2>&1
+  local rc=$?; echo $rc > $L/check.rc; date +%s > $L/check.at; return $rc
+}
+
+while sleep 10; do
   now=$(date +%s)
-  cur=$(tmux capture-pane -p -t agent 2>/dev/null | md5sum)
+  screen=$(tmux capture-pane -p -t agent 2>/dev/null)
+  cur=$(printf '%s' "$screen" | md5sum)
   [ "$cur" != "$prev" ] && last=$now && prev="$cur"
   ca=$(tmux list-clients -F '#{client_activity}' 2>/dev/null | sort -n | tail -1)
   [ -n "$ca" ] && [ "$ca" -gt "$last" ] && last=$ca
   echo $last > $L/last_activity
-  if [ $((now - last)) -ge $((idle_min * 60)) ]; then
+
+  tail=$(printf '%s' "$screen" | grep -v '^\s*$' | tail -12)
+  if printf '%s' "$tail" | grep -qiE 'esc to interrupt|esc interrupt|ctrl\+c to interrupt'; then state=working
+  elif printf '%s' "$tail" | grep -qE 'Do you want|\(y/n\)|\[Y/n\]|❯ [0-9]+\.'; then state=asking
+  else state=idle; fi
+  if [ "$state" = working ]; then worked=$((worked + 1)); fi
+  if [ "$was" = working ] && [ "$state" != working ] && [ $worked -ge 1 ]; then
+    title=$(tmux display -p -t agent '#{pane_title}' | sed 's/^[^[:alnum:]]*//')
+    msg="$(cat $L/name) is done"; [ "$state" = asking ] && msg="$(cat $L/name) is asking you something"
+    if [ -s $L/check ]; then
+      if run_check; then msg="$msg - check passed"; else msg="$msg - check FAILED"; fi
+      last=$(date +%s)
+    fi
+    notify "$msg" "\${title:-$(cat $L/prompt 2>/dev/null | head -c 200)}"
+    worked=0
+  fi
+  was=$state
+
+  if [ "$idle_min" != 0 ] && [ $((now - last)) -ge $((idle_min * 60)) ]; then
     echo "$(date -u +%FT%TZ) idle \${idle_min}m: pausing"
     sync
     LIZARD_API_KEY="$(cat $L/key)" lizard sandbox pause "$(cat $L/id)" --no-wait && exit 0
@@ -224,8 +291,14 @@ echo "TITLE $(tmux display -p -t agent '#{pane_title}')"
 echo "LAST $(cat $L/last_activity 2>/dev/null || echo 0) $(date +%s)"
 cwd=$(cat $L/cwd 2>/dev/null)
 if [ -n "$cwd" ] && [ -d "$cwd/.git" ] && [ -f $L/base ]; then
-  echo "GIT $(cd $cwd && git status --porcelain 2>/dev/null | wc -l) $(cd $cwd && git rev-list --count $(cat $L/base)..HEAD 2>/dev/null || echo 0)"
+  cd "$cwd"
+  # Against a throwaway index, so new files count too and the agent's own index is untouched.
+  export GIT_INDEX_FILE=$(mktemp); cp .git/index $GIT_INDEX_FILE 2>/dev/null; git add -A >/dev/null 2>&1
+  st=$(git diff --cached --shortstat $(cat $L/base) 2>/dev/null); rm -f $GIT_INDEX_FILE; unset GIT_INDEX_FILE
+  n() { echo "$st" | grep -o "[0-9]* $1" | grep -o '[0-9]*' || echo 0; }
+  echo "GIT $(git rev-list --count $(cat $L/base)..HEAD 2>/dev/null || echo 0) $(n insertion) $(n deletion) 0 $(n file)"
 fi
+[ -f $L/check.rc ] && echo "CHECK $(cat $L/check.rc) $(cat $L/check.at 2>/dev/null || echo 0)"
 echo "SCREEN"
 tmux capture-pane -p -t agent | sed -e 's/[[:space:]]*$//' | grep -v '^$' | tail -25
 `;
@@ -253,14 +326,17 @@ function parseProbe(out) {
   const get = (k) => (out.match(new RegExp(`^${k} (.*)$`, "m")) ?? [])[1];
   const screen = out.split(/^SCREEN$/m)[1] ?? "";
   const [last, now] = (get("LAST") ?? "0 0").split(" ").map(Number);
-  const git = get("GIT")?.split(" ").map(Number);
+  const g = get("GIT")?.split(" ").map((x) => Number(x) || 0);
+  const git = g ? { commits: g[0], added: g[1], removed: g[2], untracked: g[3], files: g[4] } : null;
+  const ck = get("CHECK")?.split(" ");
+  const check = ck ? { state: ck[0] === "running" ? "running" : ck[0] === "0" ? "passed" : "failed", rc: ck[0], at: Number(ck[1]) || 0 } : null;
   let title = (get("TITLE") ?? "").replace(/^[^\p{L}\p{N}]+/u, "").trim();
   if (!title || /^(e2b(\.local)?|localhost|bash|claude( code)?|codex|opencode)$/i.test(title)) {
     // No title from the agent: the last thing it said.
     const said = screen.split("\n").filter((l) => /^\s*(⏺|•|●)\s+\S/.test(l)).at(-1);
     title = said ? said.replace(/^\s*(⏺|•|●)\s+/, "") : "";
   }
-  return { state: classify(screen), title, idleS: last && now ? now - last : null, git, screen };
+  return { state: classify(screen), title, idleS: last && now ? now - last : null, git, check, screen };
 }
 
 async function probeAll(entries, live) {
@@ -275,15 +351,26 @@ async function probeAll(entries, live) {
 const STATE_COLOR = { working: cyan, waiting: green, asking: magenta, exited: yellow, paused: dim, pausing: dim, resuming: dim, gone: red, unreachable: red, "no agent": yellow };
 const STATE_LABEL = { waiting: "your turn", asking: "asking you" };
 
+// "+120 −30 · 2 new · 3 commits": what the session changed against where it started.
+function diffBits(g) {
+  if (!g) return "";
+  const bits = [];
+  if (g.added || g.removed) bits.push(`${green("+" + g.added)} ${red("−" + g.removed)}`);
+  if (g.untracked) bits.push(`${g.untracked} new`);
+  if (g.commits) bits.push(`${g.commits} commit${g.commits > 1 ? "s" : ""}`);
+  return bits.join(" ");
+}
+
 function renderTable(rows, cfg) {
   const w = process.stdout.columns || 120;
   const lines = rows.map((r) => {
     const st = (STATE_COLOR[r.state] ?? ((x) => x))((STATE_LABEL[r.state] ?? r.state).padEnd(11));
-    const gitBits = r.git ? [r.git[1] ? `${r.git[1]} commit${r.git[1] > 1 ? "s" : ""}` : "", r.git[0] ? `${r.git[0]} changed` : ""].filter(Boolean).join(", ") : "";
+    const gitBits = diffBits(r.git);
+    const check = r.check ? (r.check.state === "passed" ? green("✓ check") : r.check.state === "running" ? cyan("… check") : red("✗ check")) : "";
     const idle = r.status === "running" && r.idleS != null && r.state !== "working" && r.idleS >= 60 ? `idle ${Math.round(r.idleS / 60)}m` : "";
-    const text = [r.v.repo?.name, r.title ? trunc(r.title, 70) : r.v.prompt ? trunc(r.v.prompt, 70) : "", gitBits, idle].filter(Boolean);
-    const plain = `${r.name.padEnd(9)} ${"x".repeat(11)} ${r.v.agent.padEnd(8)} `;
-    return `${bold(r.name.padEnd(9))} ${st} ${dim(r.v.agent.padEnd(8))} ${trunc(text.join(" · "), Math.max(20, w - plain.length))}`;
+    const text = [r.v.repo?.name, r.title ? trunc(r.title, 60) : r.v.prompt ? trunc(r.v.prompt, 60) : "", gitBits, idle].filter(Boolean);
+    const room = Math.max(20, w - 31 - (check ? 9 : 0));
+    return `${bold(r.name.padEnd(9))} ${st} ${dim(r.v.agent.padEnd(8))} ${check ? check + " " : ""}${trunc(text.join(" · "), room)}`;
   });
   const running = rows.filter((r) => r.status === "running").length;
   const need = rows.filter((r) => r.state === "asking" || r.state === "waiting").length;
@@ -302,7 +389,10 @@ async function cmdInit(flags) {
   // The agent's login: a long-lived token in the base, so every session starts signed in.
   const tokens = {};
   for (const k of AGENTS[agent].env) if (process.env[k]) tokens[k] = process.env[k];
-  if (!Object.keys(tokens).length && rl) {
+  // Or the login connected on Lizard for this project: nothing to paste.
+  const connected = !Object.keys(tokens).length && agentConnectedOnLizard(agent, flags.project);
+  if (connected) say(`using the ${agent} login connected on Lizard (${connected})`);
+  if (!Object.keys(tokens).length && !connected && rl) {
     console.error(`\n${bold(`${agent} login`)}: ${AGENTS[agent].hint}.`);
     const v = (await rl.question(`${AGENTS[agent].env[0]} (empty to sign in by hand): `)).trim();
     if (v) tokens[v.startsWith("sk-ant-api") ? "ANTHROPIC_API_KEY" : AGENTS[agent].env[0]] = v;
@@ -336,6 +426,7 @@ async function cmdInit(flags) {
   const agentFiles = Object.entries(AGENTS).map(([n, a]) =>
     `printf '%s' ${q(a.start)} > $L/agents/${n}.new; printf '%s' ${q(a.prompt)} > $L/agents/${n}.prompt; printf '%s' ${q(a.cont)} > $L/agents/${n}.continue`).join("\n");
   const env = { IS_SANDBOX: "1", LZS_IDLE_MINUTES: String(flags["idle-minutes"] ?? 30), ...tokens };
+  if (flags.notify) env.LZS_NOTIFY = flags.notify;
   if (ghToken) env.GH_TOKEN = ghToken;
   remote(id, `set -e
 L=${REMOTE}; mkdir -p $L/agents /workspace
@@ -352,6 +443,7 @@ grep -q 'lzs: attach' /root/.bashrc || echo ${b64(BASHRC)} | base64 -d >> /root/
 ${gitName ? `git config --global user.name ${q(gitName)}` : ""}
 ${gitEmail ? `git config --global user.email ${q(gitEmail)}` : ""}
 git config --global advice.detachedHead false
+printf '%s\n' __pycache__/ '*.pyc' node_modules/ .venv/ .DS_Store .pytest_cache/ > /root/.gitignore_global && git config --global core.excludesFile /root/.gitignore_global
 ${ghToken ? `GH_TOKEN=${q(ghToken)} gh auth setup-git >/dev/null 2>&1 || true` : ""}
 # Claude Code: no first-run screens, /workspace trusted, bypass mode accepted.
 node -e '
@@ -368,6 +460,14 @@ j.skipDangerousModePermissionPrompt=true;fs.writeFileSync(f,JSON.stringify(j,nul
   // Your own setup: CLAUDE.md, skills, agents, commands, and user-level MCP servers.
   if (!flags["no-local"]) pushLocalSetup(id);
 
+  if (connected) {
+    // The terminal carries the Lizard-connected logins: keep the agent ones in the base.
+    const keys = "CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|OPENAI_API_KEY|OPENROUTER_API_KEY|MOONSHOT_API_KEY|DEEPSEEK_API_KEY";
+    const t = await terminalLine(id, `env | grep -E '^(${keys})=' > ${REMOTE}/agent-env.raw`);
+    const r = remote(id, `cd ${REMOTE} && n=0; while IFS='=' read -r k v; do [ -n "$k" ] && printf '%s=%q\\n' "$k" "$v" >> env && n=$((n+1)); done < agent-env.raw; rm -f agent-env.raw; echo $n`, { check: false });
+    if (!t.ok || !(Number(r.stdout.trim()) > 0)) die(`could not read the ${agent} login from Lizard; set ${AGENTS[agent].env[0]} and run lzs init again`);
+    tokens.__lizard = "1";
+  }
   if (!Object.keys(tokens).length) {
     if (!process.stdin.isTTY) die(`no ${agent} login: set ${AGENTS[agent].env.join(" or ")} and run lzs init again`);
     console.error(`\n${bold("Sign in by hand now.")} You are in the base sandbox's shell. Run:\n  ${agent === "claude" ? "claude setup-token   then: echo CLAUDE_CODE_OAUTH_TOKEN=<token> >> /root/.lzs/env" : agent === "codex" ? "codex login --device-auth" : "opencode auth login"}\nthen type ${bold("exit")} to save the base.\n`);
@@ -380,8 +480,17 @@ j.skipDangerousModePermissionPrompt=true;fs.writeFileSync(f,JSON.stringify(j,nul
   if (!snapId) die(`snapshot answered without an id: ${JSON.stringify(snap).slice(0, 300)}`);
   lizard(["sandbox", "rm", id], { check: false });
   if (old?.keyId && old.keyId !== key.id && old.projectId === sb.projectId) say(`older sessions still use key ${old.keyId}; delete it once they are gone: lizard keys rm ${old.keyId}`);
-  writeJson(CFG_FILE, { version: 2, agent, size, projectId: sb.projectId, projectName: sb.projectName, region: sb.region, snapshot: snapId, keyId: key.id, github: !!ghToken, createdAt: new Date().toISOString() });
+  writeJson(CFG_FILE, { version: 3, agent, size, notify: !!flags.notify, login: connected ? "lizard" : "token", projectId: sb.projectId, projectName: sb.projectName, region: sb.region, snapshot: snapId, keyId: key.id, github: !!ghToken, createdAt: new Date().toISOString() });
   console.error(`\n${green("ready")} in ${secs(t0)} s · base ${snapId} (${size}${ghToken ? ", GitHub" : ""})\n\n  ${bold("lzs")}                    a fresh session\n  ${bold("lzs .")}                  this repo in a fresh session\n  ${bold(`lzs fan 5 . -p "…"`)}     five agents on one task, then ${bold("lzs watch")}\n`);
+}
+
+// Is this agent's login connected on Lizard (Agents page / `lizard agents login`)?
+function agentConnectedOnLizard(agent, project) {
+  const kinds = { claude: ["claude", "anthropic_key", "openrouter_key"], codex: ["openai_key"], opencode: ["anthropic_key", "openai_key", "openrouter_key"] }[agent] ?? [];
+  const r = lizard(["agents", "status", ...(project ? ["--project", project] : [])], { json: true, check: false });
+  const list = r?.credentials ?? [];
+  const hit = list.find((c) => kinds.includes(c.kind) && c.connected);
+  return hit ? hit.label : null;
 }
 
 function pushLocalSetup(id) {
@@ -439,12 +548,12 @@ function repoFromArgs(rest, flags) {
 }
 
 // ---------- sessions ----------
-async function newSession({ name, agent, prompt, repo, pack, attach }) {
+async function newSession({ name, agent, prompt, repo, pack, attach, check, group }) {
   const cfg = needConfig();
   if (!AGENTS[agent]) die(`unknown agent '${agent}'`);
   const t0 = Date.now();
   const sb = lizard(["sandbox", "restore", cfg.snapshot, "--timeout", "0", "-p", cfg.projectId], { json: true });
-  const rec = { id: sb.id, agent, createdAt: new Date().toISOString(), ...(prompt ? { prompt: trunc(prompt, 200) } : {}) };
+  const rec = { id: sb.id, agent, createdAt: new Date().toISOString(), ...(prompt ? { prompt: trunc(prompt, 200) } : {}), ...(check ? { check } : {}), ...(group ? { group } : {}) };
   updateSessions((all) => { all[name] = rec; });
   let cwd = "/workspace", setup = "";
   if (repo?.kind === "local") {
@@ -461,6 +570,7 @@ async function newSession({ name, agent, prompt, repo, pack, attach }) {
   const r = remote(sb.id, `set -e
 GH_TOKEN=; [ -f ${REMOTE}/env ] && set -a && . ${REMOTE}/env && set +a
 echo ${q(sb.id)} > ${REMOTE}/id; echo ${q(name)} > ${REMOTE}/name; echo ${q(cwd)} > ${REMOTE}/cwd
+printf '%s' ${q(check ?? "")} > ${REMOTE}/check; printf '%s' ${q(prompt ?? "")} > ${REMOTE}/prompt
 ${setup}
 node -e 'const fs=require("fs"),f="/root/.claude.json";const j=JSON.parse(fs.readFileSync(f));j.projects[${JSON.stringify(cwd)}]={hasTrustDialogAccepted:true,hasCompletedProjectOnboarding:true};fs.writeFileSync(f,JSON.stringify(j))' 2>/dev/null || true
 ${REMOTE}/start.sh ${q(agent)} ${prompt ? "prompt" : "new"} ${q(b64(prompt ?? ""))}`, { check: false });
@@ -478,7 +588,7 @@ async function cmdNew(rest, flags) {
   const name = flags.name || nextNames(1)[0];
   if (sessions()[name]) die(`session '${name}' exists. Use: lzs resume ${name}`);
   try {
-    return await newSession({ name, agent: flags.agent || cfg.agent, prompt: flags.prompt, repo, pack, attach: !flags["no-attach"] });
+    return await newSession({ name, agent: flags.agent || cfg.agent, prompt: flags.prompt, repo, pack, attach: !flags["no-attach"], check: flags.check, group: flags.group });
   } finally { if (pack) fs.rmSync(path.dirname(pack.tgz), { recursive: true, force: true }); }
 }
 
@@ -490,10 +600,11 @@ async function cmdFan(rest, flags) {
   const repo = repoFromArgs(rest.slice(1), flags);
   if (repo?.kind === "local") packLocalRepo(repo.dir); // fail early, before starting anything
   const names = nextNames(n);
+  const group = `fan-${Date.now().toString(36)}`;
   const t0 = Date.now();
   say(`starting ${n} ${flags.agent || cfg.agent} sessions${repo ? ` on ${path.basename(repo.dir ?? repo.slug)}` : ""}…`);
   // Each one in its own lzs process, so they really run side by side.
-  const args = (nm) => ["new", ...(repo?.kind === "local" ? [repo.dir] : []), ...(repo?.kind === "github" ? ["--repo", repo.slug] : []), "--name", nm, "--detach", ...(flags.agent ? ["--agent", flags.agent] : []), ...(flags.prompt ? ["--prompt", flags.prompt] : [])];
+  const args = (nm) => ["new", ...(repo?.kind === "local" ? [repo.dir] : []), ...(repo?.kind === "github" ? ["--repo", repo.slug] : []), "--name", nm, "--detach", "--group", group, ...(flags.agent ? ["--agent", flags.agent] : []), ...(flags.prompt ? ["--prompt", flags.prompt] : []), ...(flags.check ? ["--check", flags.check] : [])];
   const results = await pool(names, 10, (nm) => new Promise((resolve) => {
     const p = spawn(process.execPath, [process.argv[1], ...args(nm)], { stdio: ["ignore", "ignore", "pipe"], env: process.env });
     let err = ""; p.stderr.on("data", (d) => (err += d));
@@ -504,7 +615,7 @@ async function cmdFan(rest, flags) {
     });
   }));
   const ok = results.filter(Boolean).length;
-  console.error(`\n${ok}/${n} running after ${secs(t0)} s · ${bold("lzs watch")} to follow them · ${bold("lzs resume <name>")} to step in`);
+  console.error(`\n${ok}/${n} running after ${secs(t0)} s · ${bold("lzs watch")} to follow them${flags.check ? `; each runs ${bold(flags.check)} when it finishes` : ""} · ${bold("lzs diff")} to compare · ${bold("lzs pick <name>")} to keep the best`);
   return ok === n ? 0 : 1;
 }
 
@@ -599,8 +710,9 @@ async function cmdPull(ref, flags) {
   try {
     if (v.repo?.kind === "local" && !flags.files) {
       if (!fs.existsSync(path.join(v.repo.local, ".git"))) die(`${v.repo.local} is gone; lzs pull ${name} --files copies the files instead`);
-      const msg = flags.message || `lzs ${name}: work in progress`;
-      const r = remote(v.id, `cd ${q(v.repo.path)} && git add -A && { git diff --cached --quiet || git commit -q -m ${q(msg)}; } && \
+      // The commit is named after what the agent says it did (its terminal title), else the task.
+      const msg = flags.message ? q(flags.message) : `"$(t=$(tmux display -p -t agent '#{pane_title}' 2>/dev/null | sed 's/^[^[:alnum:]]*//'); [ -n "$t" ] && [ "$t" != e2b.local ] && echo "$t" || head -c 72 ${REMOTE}/prompt 2>/dev/null || echo 'lzs ${name}')"`;
+      const r = remote(v.id, `cd ${q(v.repo.path)} && git add -A && { git diff --cached --quiet || git commit -q -m ${msg}; } && \
 if [ "$(git rev-list --count ${v.repo.base}..HEAD)" = 0 ]; then echo NOCHANGES; else git bundle create -q /tmp/lzs.bundle ${v.repo.base}..HEAD && echo BUNDLED; fi`);
       if (/NOCHANGES/.test(r.stdout)) { console.log(`${name}: no changes yet`); return 0; }
       const bundle = path.join(tmp, "lzs.bundle");
@@ -623,6 +735,86 @@ if [ "$(git rev-list --count ${v.repo.base}..HEAD)" = 0 ]; then echo NOCHANGES; 
     console.log(`${name} → ${dest}`);
     return 0;
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+}
+
+// What a session changed since it started. With a name: the diff itself (committed, uncommitted
+// and new files). Without: every session of the last fan-out (or --all) side by side, so the
+// best attempt stands out: check result, size of the change, what the agent says it did.
+async function cmdDiff(ref, flags) {
+  const cfg = needConfig();
+  if (ref && !flags.all) {
+    const [name, v] = findSession(ref);
+    if (!v.repo) die(`${name} has no repository`);
+    await wake(name, v, liveSandboxes(cfg).get(v.id));
+    const color = tty ? "-c color.ui=always" : "";
+    const r = remote(v.id, `cd ${q(v.repo.path)} && export GIT_INDEX_FILE=$(mktemp) && { cp .git/index $GIT_INDEX_FILE 2>/dev/null; git add -A >/dev/null 2>&1; \
+git ${color} diff --cached ${flags.stat ? "--stat" : ""} $(cat ${REMOTE}/base); rm -f $GIT_INDEX_FILE; true; }`);
+    if (!r.stdout.trim()) { console.log(`${name}: no changes yet`); return 0; }
+    if (tty && !flags.stat && r.stdout.split("\n").length > (process.stdout.rows || 40)) spawnSync("less", ["-R"], { input: r.stdout, stdio: ["pipe", "inherit", "inherit"] });
+    else process.stdout.write(r.stdout);
+    return 0;
+  }
+  const all = byAge(sessions()).filter(([, v]) => v.repo);
+  const lastGroup = all.map(([, v]) => v.group).filter(Boolean).at(-1);
+  const entries = flags.all || !lastGroup ? all : all.filter(([, v]) => v.group === lastGroup);
+  if (!entries.length) { console.log("no sessions with a repository. Start some with: lzs fan 3 . -p \"…\""); return 0; }
+  const rows = await probeAll(entries, liveSandboxes(cfg));
+  // Passing checks first, then the smaller change.
+  const rank = (r) => [r.check?.state === "passed" ? 0 : r.check ? 2 : 1, (r.git?.added ?? 0) + (r.git?.removed ?? 0)];
+  rows.sort((a, b) => { const x = rank(a), y = rank(b); return x[0] - y[0] || x[1] - y[1]; });
+  const w = process.stdout.columns || 120;
+  for (const r of rows) {
+    const ck = r.check ? (r.check.state === "passed" ? green("✓ passed") : r.check.state === "running" ? cyan("… running") : red("✗ failed")) : dim("no check");
+    const g = r.git ? `${green(("+" + r.git.added).padStart(6))} ${red(("−" + r.git.removed).padEnd(6))} ${String(r.git.files).padStart(3)} file${r.git.files === 1 ? " " : "s"}` : dim("     (paused)          ");
+    console.log(`${bold(r.name.padEnd(9))} ${(STATE_COLOR[r.state] ?? ((x) => x))((STATE_LABEL[r.state] ?? r.state).padEnd(11))} ${ck.padEnd(tty ? 17 : 8)} ${g}  ${trunc(r.title || r.v.prompt || "", Math.max(20, w - 62))}`);
+  }
+  console.log(dim(`\n${bold("lzs diff <name>")} for one diff · ${bold("lzs pick <name>")} to keep it and delete the others`));
+  return 0;
+}
+
+// Keep one attempt: bring its work here (lzs pull) and delete the other sessions of its fan-out.
+async function cmdPick(ref, flags) {
+  needConfig();
+  const [name, v] = findSession(ref);
+  const code = await cmdPull(name, flags);
+  if (code !== 0 || flags.keep || !v.group) return code;
+  const others = byAge(sessions()).filter(([n, o]) => o.group === v.group && n !== name).map(([n]) => n);
+  if (!others.length) return 0;
+  if (process.stdin.isTTY && !flags.yes) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+    const a = (await rl.question(`delete the other attempts (${others.join(", ")})? [Y/n] `)).trim();
+    rl.close();
+    if (/^n/i.test(a)) return 0;
+  } else if (!flags.yes) { say(`other attempts kept (${others.join(", ")}); add --yes to delete them`); return 0; }
+  return cmdRm(others, {});
+}
+
+// Run the session's check (tests, a build, a linter) now, in every sandbox at once.
+async function cmdCheck(refs, flags) {
+  const cfg = needConfig();
+  const cmd = flags.check ?? flags.run;
+  const targets = flags.all || !refs.length ? byAge(sessions()).filter(([, v]) => v.repo || cmd) : refs.map((r) => findSession(r));
+  const live = liveSandboxes(cfg);
+  const t0 = Date.now();
+  await pool(targets, 10, async ([name, v]) => {
+    const l = live.get(v.id);
+    if (!l) return console.log(`${bold(name.padEnd(9))} ${red("gone")}`);
+    await wake(name, v, l);
+    const r = await remoteAsync(v.id, `L=${REMOTE}; [ -f $L/env ] && set -a && . $L/env && set +a
+${cmd ? `printf '%s' ${q(cmd)} > $L/check` : ""}
+[ -s $L/check ] || { echo NOCHECK; exit 0; }
+echo running > $L/check.rc
+( cd "$(cat $L/cwd 2>/dev/null || echo /workspace)" && timeout "\${LZS_CHECK_TIMEOUT:-900}" bash -lc "$(cat $L/check)" ) > $L/check.log 2>&1
+rc=$?; echo $rc > $L/check.rc; date +%s > $L/check.at
+echo "RC $rc"; tail -15 $L/check.log`.replace(/\\\$\{/g, "${"), { timeoutMs: 20 * 60000 });
+    if (/NOCHECK/.test(r.stdout)) return console.log(`${bold(name.padEnd(9))} ${dim("no check set (lzs check " + name + " --check \"npm test\")")}`);
+    const rc = (r.stdout.match(/^RC (\d+)/m) ?? [])[1];
+    const tail = r.stdout.split(/^RC \d+$/m)[1]?.trim() ?? "";
+    console.log(`${bold(name.padEnd(9))} ${rc === "0" ? green("✓ passed") : red(`✗ failed (exit ${rc ?? "?"})`)}`);
+    if (rc !== "0" && tail) console.log(dim(tail.split("\n").slice(-6).map((l) => "    " + l).join("\n")));
+  });
+  console.log(dim(`\n${secs(t0)} s`));
+  return 0;
 }
 
 // Commit and push the session's branch to GitHub, and open a pull request.
@@ -705,9 +897,12 @@ function help() {
 
 ${bold("Start")}
   lzs init [--agent claude|codex|opencode] [--size nano|mini|small] [--github]
-           [--idle-minutes 30] [--project P] [--no-local]    build your base snapshot (once)
+           [--notify URL] [--idle-minutes 30] [--project P]  build your base snapshot (once); URL =
+                                                             ntfy/Slack/Discord/Telegram, pinged
+                                                             when an agent finishes, laptop closed
   lzs [. | DIR | --repo owner/name] [-p "task"] [-d]         a fresh session (. = this repo)
-  lzs fan N [. | --repo owner/name] -p "task"                N agents on one task, in the background
+  lzs fan N [. | --repo owner/name] -p "task" [--check CMD]  N agents on one task; CMD (your tests)
+                                                             runs in each one when it finishes
   lzs group N [.] [-p "task"]                                N sessions side by side (inside tmux)
 
 ${bold("Follow")}
@@ -716,6 +911,13 @@ ${bold("Follow")}
   lzs peek <name>                                            its screen, without attaching
   lzs send <name> "text" | --all "text"                      type into the agent without attaching
   lzs resume [name]                                          attach (wakes a paused one in ~2.5 s)
+
+${bold("Compare")}
+  lzs diff                                                   the last fan-out side by side: check,
+                                                             size of change, what each agent did
+  lzs diff <name> [--stat]                                   one session's diff
+  lzs check [name...] [--check CMD]                          run the check now, everywhere at once
+  lzs pick <name>                                            keep it (as a branch), delete the rest
 
 ${bold("Ship")}
   lzs pull <name>                                            the work as branch lzs/<name> in your repo
@@ -731,7 +933,7 @@ Idle sessions pause themselves after 30 minutes. Needs: npm i -g @lizard-build/c
 }
 
 // ---------- main ----------
-const COMMANDS = new Set(["init", "new", "fan", "group", "resume", "attach", "a", "ls", "list", "watch", "w", "peek", "send", "pull", "push", "open", "stop", "pause", "rm", "delete", "help"]);
+const COMMANDS = new Set(["init", "new", "fan", "group", "resume", "attach", "a", "ls", "list", "watch", "w", "peek", "send", "pull", "push", "open", "stop", "pause", "rm", "delete", "diff", "pick", "check", "help"]);
 const argv = process.argv.slice(2);
 const sub = argv[0] && COMMANDS.has(argv[0]) ? argv[0] : "";
 const { flags, rest, pass } = parse(sub ? argv.slice(1) : argv);
@@ -751,6 +953,9 @@ switch (sub) {
   case "peek": code = await cmdPeek(rest[0], flags); break;
   case "send": code = await cmdSend(flags.all ? null : rest[0], (flags.all ? rest : rest.slice(1)).join(" "), flags); break;
   case "pull": code = await cmdPull(rest[0], flags); break;
+  case "diff": code = await cmdDiff(rest[0], flags); break;
+  case "pick": code = await cmdPick(rest[0], flags); break;
+  case "check": code = await cmdCheck(rest, flags); break;
   case "push": code = await cmdPush(rest[0], flags); break;
   case "open": code = await cmdOpen(rest[0], rest[1]); break;
   case "stop": case "pause": code = cmdStop(rest, flags); break;
