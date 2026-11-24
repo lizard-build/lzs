@@ -3,7 +3,7 @@
 Coding agents in the cloud, one command per session. Run 50 at once without melting your laptop.
 
 ```sh
-npm i -g @lizard-build/cli @lizard-build/lzs
+npm i -g @lizard-build/cli github:lizard-build/lzs
 lizard login
 lzs init                         # once: your base snapshot (agent login, skills, MCPs)
 

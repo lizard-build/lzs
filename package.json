@@ -3,10 +3,33 @@
   "version": "0.3.0",
   "description": "Run coding agents (Claude Code, Codex, OpenCode) in Lizard sandboxes: one command per session, keeps going when your laptop sleeps, pauses itself when idle.",
   "type": "module",
-  "bin": { "lzs": "./lzs" },
-  "files": ["lzs", "README.md", "LICENSE"],
-  "engines": { "node": ">=18" },
-  "keywords": ["claude-code", "codex", "opencode", "coding-agent", "sandbox", "parallel-agents", "lizard"],
+  "bin": {
+    "lzs": "./lzs"
+  },
+  "files": [
+    "lzs",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "opencode",
+    "coding-agent",
+    "sandbox",
+    "parallel-agents",
+    "lizard"
+  ],
   "homepage": "https://lizard.build",
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lizard-build/lzs.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lizard-build/lzs/issues"
+  }
 }

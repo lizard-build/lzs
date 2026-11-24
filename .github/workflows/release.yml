@@ -1,0 +1,28 @@
+name: Release
+
+# Publishes to npm when package.json's version has no tag yet (npm trusted publishing, no token).
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Check
+        run: node --check lzs && node lzs --version
+      - name: Publish if new
+        run: |
+          V=$(node -p "require('./package.json').version")
+          if git ls-remote --tags origin "refs/tags/v$V" | grep -q .; then echo "v$V already released"; exit 0; fi
+          npm install -g npm@latest
+          npm publish --access public --provenance
+          git tag "v$V" && git push origin "v$V"
