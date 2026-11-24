@@ -1,0 +1,452 @@
+#!/usr/bin/env node
+// lzs: run coding agents (claude, codex, opencode) in Lizard sandboxes, one command per session.
+//
+//   lzs init                 build your base snapshot once (agent login, skills, MCPs, tmux)
+//   lzs                      new sandbox from the snapshot, agent started, you are attached
+//   lzs resume <name>        wake a paused session (~1.5 s) and continue the conversation
+//
+// Everything goes through the `lizard` CLI (npm i -g @lizard-build/cli), signed in once with
+// `lizard login`. Each session is its own sandbox; the agent runs in tmux inside it, so it keeps
+// working when your laptop sleeps, and a watchdog in the sandbox pauses it after it has been
+// idle for a while (compute billing stops; files and the agent's history stay).
+
+import { spawnSync, spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import readline from "node:readline/promises";
+
+const VERSION = "0.1.0";
+const HOME = os.homedir();
+const CFG_DIR = process.env.LZS_HOME || path.join(HOME, ".config", "lzs");
+const CFG_FILE = path.join(CFG_DIR, "config.json");
+const STATE_FILE = path.join(CFG_DIR, "sessions.json");
+const REMOTE = "/root/.lzs";
+
+// How each agent starts fresh, continues its last conversation, gets installed, and reads its login.
+const AGENTS = {
+  claude: {
+    install: "true", // in the claude template already
+    start: "claude --dangerously-skip-permissions",
+    cont: "claude --continue --dangerously-skip-permissions || claude --dangerously-skip-permissions",
+    env: ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+    hint: "run `claude setup-token` on your machine and paste the token (a 1-year token every session can share)",
+  },
+  codex: {
+    install: "command -v codex >/dev/null || npm i -g @openai/codex >/dev/null 2>&1",
+    start: "codex --dangerously-bypass-approvals-and-sandbox",
+    cont: "codex resume --last --dangerously-bypass-approvals-and-sandbox || codex --dangerously-bypass-approvals-and-sandbox",
+    env: ["OPENAI_API_KEY"],
+    hint: "paste an OpenAI API key, or leave empty and run `codex login --device-auth` in the base shell",
+  },
+  opencode: {
+    install: "command -v opencode >/dev/null || npm i -g opencode-ai >/dev/null 2>&1",
+    start: "opencode",
+    cont: "opencode --continue || opencode",
+    env: ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
+    hint: "paste a provider API key, or leave empty and run `opencode auth login` in the base shell",
+  },
+};
+
+// ---------- small helpers ----------
+const c = (n) => (s) => (process.stdout.isTTY ? `\x1b[${n}m${s}\x1b[0m` : s);
+const dim = c(2), bold = c(1), green = c(32), red = c(31), yellow = c(33);
+const say = (m) => console.error(dim("lzs ") + m);
+const die = (m, code = 1) => { console.error(red("lzs: ") + m); process.exit(code); };
+const readJson = (f, d) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return d; } };
+const writeJson = (f, v) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, JSON.stringify(v, null, 2) + "\n", { mode: 0o600 }); };
+const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+const b64 = (s) => Buffer.from(s).toString("base64");
+
+function lizard(args, { json = false, input, inherit = false, check = true } = {}) {
+  const full = json ? [...args, "--json"] : args;
+  const r = spawnSync("lizard", full, { encoding: "utf8", input, stdio: inherit ? "inherit" : ["pipe", "pipe", "pipe"], maxBuffer: 64 << 20 });
+  if (r.error?.code === "ENOENT") die("the `lizard` CLI is not installed. Run: npm i -g @lizard-build/cli && lizard login");
+  if (check && r.status !== 0) die(`lizard ${args.slice(0, 3).join(" ")} failed${r.stderr ? `:\n${r.stderr.trim()}` : ""}`);
+  if (!json) return r;
+  try { return JSON.parse(r.stdout); } catch { die(`could not read the output of lizard ${args.slice(0, 3).join(" ")}:\n${(r.stdout || r.stderr || "").slice(0, 500)}`); }
+}
+
+// Run a bash script inside a sandbox. The script travels base64-encoded, so no quoting surprises.
+function remote(id, script, { check = true, inherit = false } = {}) {
+  const r = lizard(["sandbox", "exec", id, "--", "bash", "-lc", `echo ${b64(script)} | base64 -d | bash`], { check: false, inherit });
+  if (check && r.status !== 0) die(`command in ${id} failed:\n${(r.stderr || r.stdout || "").trim().slice(-2000)}`);
+  return r;
+}
+
+const shell = (id) => spawnSync("lizard", ["sandbox", "ssh", id], { stdio: "inherit" }).status ?? 1;
+
+const BOOL_FLAGS = new Set(["yes", "y", "no-attach", "no-local", "all", "json", "help", "h", "version", "v"]);
+
+function parse(argv) {
+  const flags = {}, rest = [];
+  let pass = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--") { pass = argv.slice(i + 1); break; }
+    const m = a.match(/^--?([a-z][\w-]*)(?:=(.*))?$/i);
+    if (!m) { rest.push(a); continue; }
+    const k = m[1];
+    if (BOOL_FLAGS.has(k)) flags[k] = true;
+    else if (m[2] !== undefined) flags[k] = m[2];
+    else if (i + 1 < argv.length && !argv[i + 1].startsWith("-")) flags[k] = argv[++i];
+    else die(`--${k} needs a value`);
+  }
+  return { flags, rest, pass };
+}
+
+const config = () => readJson(CFG_FILE, null);
+const needConfig = () => config() ?? die("no base snapshot yet. Run: lzs init");
+const sessions = () => readJson(STATE_FILE, {});
+// Read-modify-write under a lock directory: `lzs group` starts several lzs at once.
+function updateSessions(fn) {
+  const lock = STATE_FILE + ".lock";
+  fs.mkdirSync(CFG_DIR, { recursive: true });
+  for (let i = 0; ; i++) {
+    try { fs.mkdirSync(lock); break; } catch {
+      if (i > 200) { fs.rmSync(lock, { recursive: true, force: true }); continue; } // stale lock (~10 s)
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+  try { const s = sessions(); fn(s); writeJson(STATE_FILE, s); } finally { fs.rmSync(lock, { recursive: true, force: true }); }
+}
+
+function nextName(s) { let n = 1; while (s[`lzs-${n}`]) n++; return `lzs-${n}`; }
+
+function findSession(ref) {
+  const s = sessions();
+  if (!ref) return null;
+  if (s[ref]) return [ref, s[ref]];
+  if (/^\d+$/.test(ref) && s[`lzs-${ref}`]) return [`lzs-${ref}`, s[`lzs-${ref}`]];
+  const hit = Object.entries(s).find(([, v]) => v.id === ref);
+  return hit ?? die(`no session '${ref}'. See: lzs ls`);
+}
+
+function liveSandboxes(cfg) {
+  const list = lizard(["sandbox", "ls", "-p", cfg.projectId], { json: true });
+  const arr = Array.isArray(list) ? list : list.sandboxes ?? [];
+  return new Map(arr.map((x) => [x.id, x]));
+}
+
+// ---------- what lives inside the sandbox ----------
+// start.sh <agent> <new|continue> <b64 extra args>: (re)start the agent in tmux and the watchdog.
+const START_SH = String.raw`#!/bin/bash
+set -u
+L=/root/.lzs
+agent="$1"; mode="$2"; extra="$(echo "\${3:-}" | base64 -d 2>/dev/null)"
+[ -f $L/env ] && set -a && . $L/env && set +a
+cmd="$(cat $L/agents/$agent.$mode)"
+[ -n "$extra" ] && cmd="$(cat $L/agents/$agent.start) $extra"
+mkdir -p /workspace
+if ! tmux has-session -t agent 2>/dev/null; then
+  tmux new-session -d -s agent -c /workspace -x 220 -y 50 "bash -lc $(printf %q "$cmd"); echo; echo '[agent exited: Ctrl-b d to detach, or keep using this shell]'; exec bash -l"
+  tmux set -g mouse on; tmux set -g history-limit 50000; tmux set -g status-right "lzs · $(cat $L/name 2>/dev/null)"
+fi
+pkill -f "$L/watchdog.sh" 2>/dev/null
+setsid nohup $L/watchdog.sh >$L/watchdog.log 2>&1 </dev/null &
+`.replace(/\\\$\{/g, "${");
+
+// Pauses the sandbox itself once nothing has happened for LZS_IDLE_MINUTES: no change on the
+// agent's screen and no keystroke from anyone attached. Pausing keeps the files; billing stops.
+const WATCHDOG_SH = String.raw`#!/bin/bash
+L=/root/.lzs
+[ -f $L/env ] && set -a && . $L/env && set +a
+idle_min="\${LZS_IDLE_MINUTES:-30}"
+[ "$idle_min" = 0 ] && exit 0
+last=$(date +%s); prev=""
+while sleep 30; do
+  now=$(date +%s)
+  cur=$(tmux capture-pane -p -t agent 2>/dev/null | md5sum)
+  [ "$cur" != "$prev" ] && last=$now && prev="$cur"
+  ca=$(tmux list-clients -F '#{client_activity}' 2>/dev/null | sort -n | tail -1)
+  [ -n "$ca" ] && [ "$ca" -gt "$last" ] && last=$ca
+  if [ $((now - last)) -ge $((idle_min * 60)) ]; then
+    echo "$(date -u +%FT%TZ) idle \${idle_min}m: pausing"
+    sync
+    LIZARD_API_KEY="$(cat $L/key)" lizard sandbox pause "$(cat $L/id)" --no-wait && exit 0
+    last=$now
+  fi
+done
+`.replace(/\\\$\{/g, "${");
+
+// An interactive login shell lands straight in the agent's tmux session (lzs attach, or the
+// terminal on lizard.build). Ctrl-b d detaches and closes the connection.
+const BASHRC = String.raw`
+# lzs: attach to the agent
+if [ -z "\${TMUX:-}" ] && [ -t 0 ] && [ -z "\${LZS_NO_ATTACH:-}" ] && [ -f /root/.lzs/id ] && tmux has-session -t agent 2>/dev/null; then
+  exec tmux attach -t agent
+fi
+`.replace(/\\\$\{/g, "${");
+
+// ---------- commands ----------
+async function cmdInit(flags) {
+  const agent = flags.agent || "claude";
+  if (!AGENTS[agent]) die(`unknown agent '${agent}' (claude, codex, opencode)`);
+  const size = flags.size || "nano";
+  const old = config();
+
+  // The agent's login: a long-lived token in the base, so every session starts signed in.
+  let tokens = {};
+  for (const k of AGENTS[agent].env) if (process.env[k]) tokens[k] = process.env[k];
+  if (!Object.keys(tokens).length && old?.agent === agent && old.hasToken) say("keeping the agent login from your current base (inside the snapshot)");
+  else if (!Object.keys(tokens).length && process.stdin.isTTY) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+    console.error(`\n${bold(`${agent} login`)}: ${AGENTS[agent].hint}.`);
+    const v = (await rl.question(`${AGENTS[agent].env[0]} (empty to sign in by hand): `)).trim();
+    rl.close();
+    if (v) tokens[v.startsWith("sk-ant-api") ? "ANTHROPIC_API_KEY" : AGENTS[agent].env[0]] = v;
+  }
+
+  say(`creating the base sandbox (${size}, template claude)…`);
+  const create = ["sandbox", "create", "-t", "claude", "-s", size, "--timeout", "2h"];
+  if (flags.project) create.push("-p", flags.project);
+  if (flags.region) create.push("--region", flags.region);
+  const sb = lizard(create, { json: true });
+  const id = sb.id;
+  say(`base sandbox ${id} in project ${sb.projectName ?? sb.projectId}`);
+
+  // One project-scoped key, kept in the base, lets each sandbox pause itself when idle.
+  const key = lizard(["keys", "create", `lzs-${sb.projectName ?? sb.projectId}`.slice(0, 60), "-p", sb.projectId], { json: true });
+
+  say("installing tmux and the agents…");
+  const agentFiles = Object.entries(AGENTS).map(([n, a]) =>
+    `printf '%s' ${q(a.start)} > $L/agents/${n}.new; printf '%s' ${q(a.start)} > $L/agents/${n}.start; printf '%s' ${q(a.cont)} > $L/agents/${n}.continue`).join("\n");
+  const env = { IS_SANDBOX: "1", LZS_IDLE_MINUTES: String(flags["idle-minutes"] ?? 30), ...tokens };
+  remote(id, `set -e
+L=${REMOTE}; mkdir -p $L/agents /workspace
+command -v tmux >/dev/null || { apt-get update -qq >/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tmux >/dev/null; }
+${AGENTS[agent].install}
+echo ${b64(START_SH)} | base64 -d > $L/start.sh
+echo ${b64(WATCHDOG_SH)} | base64 -d > $L/watchdog.sh
+chmod +x $L/*.sh
+${agentFiles}
+echo ${b64(Object.entries(env).map(([k, v]) => `${k}=${q(v)}`).join("\n") + "\n")} | base64 -d > $L/env
+echo ${b64(key.key)} | base64 -d > $L/key
+chmod 600 $L/env $L/key
+grep -q 'lzs: attach' /root/.bashrc || echo ${b64(BASHRC)} | base64 -d >> /root/.bashrc
+# Claude Code: no first-run screens, /workspace trusted, bypass mode accepted.
+node -e '
+const fs=require("fs"),f="/root/.claude.json";let j={};try{j=JSON.parse(fs.readFileSync(f))}catch{}
+j.hasCompletedOnboarding=true;j.bypassPermissionsModeAccepted=true;j.projects=j.projects||{};
+j.projects["/workspace"]={...(j.projects["/workspace"]||{}),hasTrustDialogAccepted:true,hasCompletedProjectOnboarding:true};
+fs.writeFileSync(f,JSON.stringify(j,null,2))'
+mkdir -p /root/.claude
+node -e '
+const fs=require("fs"),f="/root/.claude/settings.json";let j={};try{j=JSON.parse(fs.readFileSync(f))}catch{}
+j.skipDangerousModePermissionPrompt=true;fs.writeFileSync(f,JSON.stringify(j,null,2))'
+`);
+
+  // Your own setup: CLAUDE.md, settings, skills, agents, commands, and user-level MCP servers.
+  if (!flags["no-local"]) await pushLocalSetup(id);
+
+  if (!Object.keys(tokens).length && !(old?.agent === agent && old.hasToken)) {
+    console.error(`\n${bold("Sign in by hand now.")} You are in the base sandbox's shell. Run:\n  ${agent === "claude" ? "claude setup-token   (then: echo CLAUDE_CODE_OAUTH_TOKEN=<token> >> /root/.lzs/env)" : agent === "codex" ? "codex login --device-auth" : "opencode auth login"}\nthen type ${bold("exit")} to save the base.\n`);
+    shell(id);
+  }
+
+  say("saving the base snapshot…");
+  const snap = lizard(["sandbox", "snapshot", id, "--name", "lzs-base"], { json: true });
+  const snapId = snap.id ?? snap.snapshotId;
+  if (!snapId) die(`snapshot answered without an id: ${JSON.stringify(snap).slice(0, 300)}`);
+  lizard(["sandbox", "rm", id], { check: false });
+  if (old?.keyId && old.keyId !== key.id && old.projectId === sb.projectId) {
+    // Sessions from the old base still hold the old key; keep it until they are gone.
+    say(`previous key ${old.keyId} kept for older sessions (delete it with: lizard keys rm ${old.keyId})`);
+  }
+  writeJson(CFG_FILE, { version: 1, agent, size, projectId: sb.projectId, projectName: sb.projectName, region: sb.region, snapshot: snapId, keyId: key.id, hasToken: Object.keys(tokens).length > 0 || !!old?.hasToken, createdAt: new Date().toISOString() });
+  console.error(`\n${green("ready")}  base snapshot ${snapId} (${size}). Start a session with: ${bold("lzs")}`);
+}
+
+async function pushLocalSetup(id) {
+  const claudeDir = path.join(HOME, ".claude");
+  const items = ["CLAUDE.md", "skills", "agents", "commands"].filter((x) => fs.existsSync(path.join(claudeDir, x)));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "lzs-"));
+  try {
+    if (items.length) {
+      const tgz = path.join(tmp, "claude.tgz");
+      const r = spawnSync("tar", ["-czf", tgz, "-C", claudeDir, "--exclude=.git", "--exclude=node_modules", ...items], { stdio: "pipe" });
+      if (r.status === 0) {
+        lizard(["sandbox", "files", "put", id, tgz, "/tmp/lzs-claude.tgz"]);
+        remote(id, "mkdir -p /root/.claude && tar -xzf /tmp/lzs-claude.tgz -C /root/.claude && rm /tmp/lzs-claude.tgz");
+        say(`copied ~/.claude: ${items.join(", ")}`);
+      }
+    }
+    // User-level MCP servers from ~/.claude.json (only that key: the rest is your local state).
+    const local = readJson(path.join(HOME, ".claude.json"), {});
+    if (local.mcpServers && Object.keys(local.mcpServers).length) {
+      const f = path.join(tmp, "mcp.json");
+      fs.writeFileSync(f, JSON.stringify(local.mcpServers));
+      lizard(["sandbox", "files", "put", id, f, "/tmp/lzs-mcp.json"]);
+      remote(id, `node -e 'const fs=require("fs"),f="/root/.claude.json";const j=JSON.parse(fs.readFileSync(f));j.mcpServers={...(j.mcpServers||{}),...JSON.parse(fs.readFileSync("/tmp/lzs-mcp.json"))};fs.writeFileSync(f,JSON.stringify(j,null,2))' && rm /tmp/lzs-mcp.json`);
+      say(`copied MCP servers: ${Object.keys(local.mcpServers).join(", ")}`);
+    }
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+}
+
+function startAgent(id, name, agent, mode, pass) {
+  remote(id, `echo ${q(id)} > ${REMOTE}/id; echo ${q(name)} > ${REMOTE}/name; ${REMOTE}/start.sh ${q(agent)} ${mode} ${q(b64(pass.join(" ")))}`);
+}
+
+function cmdNew(flags, pass) {
+  const cfg = needConfig();
+  const agent = flags.agent || cfg.agent;
+  if (!AGENTS[agent]) die(`unknown agent '${agent}'`);
+  const s = sessions();
+  const name = flags.name || nextName(s);
+  if (s[name]) die(`session '${name}' exists. Use: lzs resume ${name}`);
+  const t0 = Date.now();
+  const sb = lizard(["sandbox", "restore", cfg.snapshot, "--timeout", "0", "-p", cfg.projectId], { json: true });
+  updateSessions((all) => { all[name] = { id: sb.id, agent, createdAt: new Date().toISOString() }; });
+  startAgent(sb.id, name, agent, "new", pass);
+  say(`${bold(name)} (${sb.id}, ${agent}) ready in ${((Date.now() - t0) / 1000).toFixed(1)} s · Ctrl-b d to detach, lzs resume ${name} to come back`);
+  if (flags["no-attach"]) return 0;
+  return shell(sb.id);
+}
+
+function cmdResume(ref, flags) {
+  const cfg = needConfig();
+  let pick = ref ? findSession(ref) : null;
+  if (!pick) {
+    const s = Object.entries(sessions());
+    if (!s.length) die("no sessions. Start one with: lzs");
+    pick = s[s.length - 1];
+  }
+  const [name, sess] = pick;
+  const live = liveSandboxes(cfg).get(sess.id);
+  if (!live) die(`${name}'s sandbox ${sess.id} is gone. Remove it with: lzs rm ${name}`);
+  const t0 = Date.now();
+  if (live.status === "paused" || live.status === "pausing") {
+    lizard(["sandbox", "resume", sess.id]);
+    startAgent(sess.id, name, sess.agent, "continue", []);
+    say(`${bold(name)} woke in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+  } else {
+    // Running: make sure the agent and watchdog are there (no-op when they are).
+    startAgent(sess.id, name, sess.agent, "continue", []);
+  }
+  if (flags["no-attach"]) return 0;
+  return shell(sess.id);
+}
+
+function cmdLs(flags) {
+  const cfg = needConfig();
+  const live = liveSandboxes(cfg);
+  const s = sessions();
+  const rows = Object.entries(s).map(([name, v]) => {
+    const l = live.get(v.id);
+    return { name, id: v.id, agent: v.agent, status: l?.status ?? "gone", created: v.createdAt };
+  });
+  if (flags.json) { console.log(JSON.stringify(rows, null, 2)); return 0; }
+  if (!rows.length) { console.log("no sessions. Start one with: lzs"); return 0; }
+  const col = { running: green, paused: yellow, gone: red };
+  for (const r of rows) console.log(`${bold(r.name.padEnd(10))} ${(col[r.status] ?? ((x) => x))(r.status.padEnd(8))} ${r.agent.padEnd(9)} ${dim(r.id)}  ${dim(ago(r.created))}`);
+  const running = rows.filter((r) => r.status === "running").length;
+  console.log(dim(`\n${running} running · ${cfg.size} · base ${cfg.snapshot}`));
+  return 0;
+}
+
+function ago(iso) {
+  const m = Math.round((Date.now() - Date.parse(iso)) / 60000);
+  return m < 60 ? `${m}m ago` : m < 2880 ? `${Math.round(m / 60)}h ago` : `${Math.round(m / 1440)}d ago`;
+}
+
+function cmdStop(refs, flags) {
+  needConfig();
+  const targets = flags.all ? Object.keys(sessions()) : refs;
+  if (!targets.length) die("usage: lzs stop <name>... | --all");
+  for (const r of targets) {
+    const [name, v] = findSession(r);
+    const res = lizard(["sandbox", "pause", v.id], { check: false });
+    say(res.status === 0 ? `${name} paused (files kept, compute billing stopped)` : `${name}: ${(res.stderr || "").trim()}`);
+  }
+  return 0;
+}
+
+function cmdRm(refs, flags) {
+  needConfig();
+  const s = sessions();
+  const targets = flags.all ? Object.keys(s) : refs;
+  if (!targets.length) die("usage: lzs rm <name>... | --all");
+  for (const r of targets) {
+    const [name, v] = findSession(r);
+    lizard(["sandbox", "rm", v.id], { check: false });
+    updateSessions((all) => { delete all[name]; });
+    say(`${name} deleted`);
+  }
+  return 0;
+}
+
+// Copy a session's work to this machine: /workspace and the agent's conversation history.
+function cmdPull(ref, flags) {
+  const cfg = needConfig();
+  const [name, v] = findSession(ref) ?? die("usage: lzs pull <name> [--to DIR]");
+  const st = liveSandboxes(cfg).get(v.id)?.status;
+  if (st === "paused") lizard(["sandbox", "resume", v.id]);
+  const dest = path.resolve(flags.to || path.join(CFG_DIR, "pulled", name));
+  fs.mkdirSync(dest, { recursive: true });
+  remote(v.id, `cd / && tar -czf /tmp/lzs-pull.tgz --exclude=node_modules --exclude=.venv workspace $(ls -d root/.claude/projects root/.codex/sessions root/.local/share/opencode 2>/dev/null)`);
+  const tgz = path.join(dest, "..", `${name}.tgz`);
+  lizard(["sandbox", "files", "get", v.id, "/tmp/lzs-pull.tgz", tgz]);
+  remote(v.id, "rm -f /tmp/lzs-pull.tgz", { check: false });
+  spawnSync("tar", ["-xzf", tgz, "-C", dest], { stdio: "inherit" });
+  fs.rmSync(tgz, { force: true });
+  console.log(`${name} → ${dest}`);
+  return 0;
+}
+
+// N sessions side by side: tmux panes locally, each its own sandbox.
+function cmdGroup(n, flags, pass) {
+  needConfig();
+  const count = Math.max(1, Math.min(16, parseInt(n || "4", 10)));
+  if (!process.env.TMUX) die(`run lzs group inside tmux (tmux new -s agents), or open ${count} terminals and run lzs in each`);
+  const self = process.argv[1];
+  const extra = [flags.agent ? `--agent ${q(flags.agent)}` : "", pass.length ? `-- ${pass.map(q).join(" ")}` : ""].join(" ");
+  // Names are picked here, up front: panes starting at the same moment would otherwise race for one.
+  const taken = { ...sessions() };
+  const names = Array.from({ length: count }, () => { const n = nextName(taken); taken[n] = {}; return n; });
+  const env = process.env.LZS_HOME ? `LZS_HOME=${q(process.env.LZS_HOME)} ` : "";
+  for (const name of names.slice(1)) {
+    spawnSync("tmux", ["split-window", "-d", `${env}${q(process.execPath)} ${q(self)} --name ${name} ${extra}; printf 'session ended, Enter to close'; read _`], { stdio: "inherit" });
+    spawnSync("tmux", ["select-layout", "tiled"], { stdio: "ignore" });
+  }
+  return cmdNew({ ...flags, name: names[0] }, pass);
+}
+
+function help() {
+  console.log(`${bold("lzs")} ${VERSION}: coding agents in Lizard sandboxes, one command per session
+
+  lzs init [--agent claude|codex|opencode] [--size nano|mini|small] [--project P]
+           [--idle-minutes 30] [--no-local]       build the base snapshot (run once, or to update it)
+  lzs [--agent A] [--name N] [-- agent args]      new session: sandbox + agent, attached
+  lzs resume [name]                               wake a paused session and attach (default: newest)
+  lzs ls                                          sessions and their status
+  lzs stop <name>... | --all                      pause now (files kept, compute billing stops)
+  lzs rm <name>... | --all                        delete sessions
+  lzs pull <name> [--to DIR]                      copy /workspace + agent history to this machine
+  lzs group [N]                                   N sessions side by side (inside tmux)
+
+Inside a session: Ctrl-b d detaches (the agent keeps going), Ctrl-b c opens another shell.
+A session pauses itself after ${"$"}LZS_IDLE_MINUTES (30) idle minutes; lzs resume wakes it in ~1.5 s.
+Needs the lizard CLI: npm i -g @lizard-build/cli && lizard login`);
+}
+
+// ---------- main ----------
+const argv = process.argv.slice(2);
+const sub = argv[0] && !argv[0].startsWith("-") ? argv[0] : "";
+const { flags, rest, pass } = parse(sub ? argv.slice(1) : argv);
+if (flags.version || flags.v) { console.log(VERSION); process.exit(0); }
+if (flags.help || flags.h || sub === "help") { help(); process.exit(0); }
+
+let code = 0;
+switch (sub) {
+  case "": code = cmdNew(flags, pass); break;
+  case "init": await cmdInit(flags); break;
+  case "new": code = cmdNew(flags, pass); break;
+  case "resume": case "attach": case "a": code = cmdResume(rest[0], flags); break;
+  case "ls": case "list": code = cmdLs(flags); break;
+  case "stop": case "pause": code = cmdStop(rest, flags); break;
+  case "rm": case "delete": code = cmdRm(rest, flags); break;
+  case "pull": code = cmdPull(rest[0], flags); break;
+  case "group": code = cmdGroup(rest[0], flags, pass); break;
+  default: die(`unknown command '${sub}'. See: lzs --help`);
+}
+process.exit(code ?? 0);
