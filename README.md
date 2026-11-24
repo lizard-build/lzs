@@ -57,12 +57,7 @@ npm i -g @lizard-build/cli @lizard-build/lzs
 lizard login
 ```
 
-Today, sessions need `lizard` signed in with an **API key** (a `liz_…` key), not just the browser login. Make one and sign in with it:
-
-```sh
-lizard keys create lzs          # prints a liz_… key; copy it
-lizard login --token liz_…      # or: export LIZARD_TOKEN=liz_…
-```
+The browser login is enough (`@lizard-build/cli` 4.0.136 or newer). With an older CLI, update it (`npm i -g @lizard-build/cli`), or sign in with an API key instead: `lizard keys create lzs`, then `lizard login --token liz_…`.
 
 **3. Connect your agent's login.** For Claude Code, make a long-lived token and add it to the project lzs will use (agent logins on Lizard are **per project**):
 
@@ -196,7 +191,6 @@ Limits count vCPU, and a Nano session counts as 1. When you hit a limit, lzs say
 ## Known limitations
 
 - **On the trial, every sandbox is deleted 1 hour after it starts**, even when paused, and 2 run at once (US regions only). lzs warns when a session starts on the trial: `lzs pull` your work before the hour is up. Upgrade to Pro (first payment ends the trial limits): https://lizard.build/pricing
-- **Sessions need an API-key login.** After a plain `lizard login`, starting a session fails with "`--with-token` expects a liz_ API key". Sign in with a key from `lizard keys create` ([Setup, step 2](#setup)).
 
 ## Security model
 
@@ -288,7 +282,7 @@ Pass `--new-project` (recommended: a project for lzs alone) or `--project <name>
 <details>
 <summary><b>"--with-token expects a liz_ API key"</b></summary>
 
-You're signed in to `lizard` with the browser login. Create a key with `lizard keys create lzs` and sign in with it (`lizard login --token liz_…`, or set `LIZARD_TOKEN`).
+Your `lizard` CLI is older than 4.0.136, which needed an API key for this. Update it: `npm i -g @lizard-build/cli`. (Or sign in with a key: `lizard keys create lzs`, then `lizard login --token liz_…`.)
 
 </details>
 
