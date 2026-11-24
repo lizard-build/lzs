@@ -52,7 +52,7 @@ const AGENTS = {
     env: ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
     files: [],
     kinds: ["claude", "anthropic_key", "openrouter_key"],
-    hint: "run `claude setup-token` on your machine and set CLAUDE_CODE_OAUTH_TOKEN (one long-lived token is safe for many sessions at once), or connect Claude on Lizard: lizard agents login claude",
+    hint: "run `claude setup-token` on your machine, then set CLAUDE_CODE_OAUTH_TOKEN to the token it prints (one long-lived token is safe for many sessions at once), or add it to the project on Lizard: lizard agents add claude -p <project> (or the project's Agents page on lizard.build)",
   },
   codex: {
     pkg: "@openai/codex",
@@ -62,7 +62,7 @@ const AGENTS = {
     env: ["OPENAI_API_KEY"],
     files: ["/root/.codex/auth.json"],
     kinds: ["openai_key", "chatgpt"],
-    hint: "set OPENAI_API_KEY, or connect an OpenAI key on Lizard (lizard agents login), or sign in by hand when lzs init opens the base shell (codex login --device-auth)",
+    hint: "set OPENAI_API_KEY, or connect it on Lizard (an OpenAI key: lizard agents add openai -p <project>; your ChatGPT plan: lizard agents login -p <project>), or sign in by hand when lzs init opens the base shell (codex login --device-auth)",
   },
   opencode: {
     pkg: "opencode-ai",
@@ -203,7 +203,11 @@ function lizard(args, { json = false, input, inherit = false, check = true } = {
   const full = json ? [...args, "--json"] : args;
   const r = spawnSync("lizard", full, { encoding: "utf8", input, stdio: inherit ? "inherit" : ["pipe", "pipe", "pipe"], maxBuffer: 64 << 20 });
   if (r.error?.code === "ENOENT") die("the `lizard` CLI is not installed. Run: npm i -g @lizard-build/cli && lizard login");
-  if (check && r.status !== 0) die(`lizard ${args.slice(0, 3).join(" ")} failed: ${lizardError(r)}`);
+  if (check && r.status !== 0) {
+    const e = lizardErr(r), p = planRefusal(e);
+    if (p) die(`lizard ${args.slice(0, 3).join(" ")} was refused: ${p.why.replace(/[.\s]+$/, "")}.${p.next.map((l) => `\n  ${l}`).join("")}`, EXIT_LIMIT);
+    die(`lizard ${args.slice(0, 3).join(" ")} failed: ${e.message}`);
+  }
   if (!json) return r;
   try { return JSON.parse(r.stdout); } catch { die(`could not read the output of lizard ${args.slice(0, 3).join(" ")}: ${lizardError(r).slice(0, 500)}`); }
 }
@@ -234,15 +238,77 @@ function lizardTry(args) {
   return { ok: false, error: lizardErr(r) };
 }
 
-// Lizard said no to a new sandbox: say what the limit is and how to get under it.
-function refusal(err, what = "a new sandbox") {
-  const code = String(err?.code ?? "");
-  if (err?.status === 429 || /^SANDBOX_(LIMIT_REACHED|RATE_LIMITED)$/.test(code)) {
-    const b = err.body ?? {};
-    const counts = b.running != null && b.limit != null ? ` (${b.running} running, limit ${b.limit}${b.unit === "vcpu" ? " vCPU" : ""})` : b.limit != null ? ` (limit ${b.limit}${b.unit === "vcpu" ? " vCPU" : ""})` : "";
-    const free = code === "SANDBOX_RATE_LIMITED" ? "  wait a little and try again" : "  free one: lzs stop <name> pauses a session (lzs ls shows which run), lzs rm <name> deletes it";
-    return { limit: true, text: `Lizard refused ${what}: limit reached${counts}. ${err.message}\n${free}` };
+// ---------- plan limits ----------
+// What the account's plan allows (lizard.build/pricing): every Pro plan has no start limits and
+// caps the vCPU running at once (Pro $19: 40, Pro $99: 220; a Nano agent counts as 1);
+// pay-as-you-go has start limits and 40 at once; the trial (Pro before its first payment) runs
+// 2 Nano at once, US regions only, each deleted 1 hour after it starts.
+const PRICING = "https://lizard.build/pricing";
+const UPGRADE = `Upgrade to Pro for more agents at once and no start limits: ${PRICING}`;
+const UPGRADE_TRIAL = `Upgrade to Pro (first payment ends the trial limits): ${PRICING}`;
+const START_TRIAL = `Start the 7-day Pro trial at ${PRICING} (card needed, $5 of usage included, then $19/month)`;
+const FREE_ONE = "free one: lzs stop <name> pauses a session (lzs ls shows which run), lzs rm <name> deletes it";
+const TRIAL_AT_ONCE = { nano: 2, mini: 2, small: 1 };
+const sizeName = (s) => (s ? String(s).charAt(0).toUpperCase() + String(s).slice(1) : "sandbox");
+const waitText = (s) => (s >= 3600 ? `${Math.ceil(s / 3600)} h` : s >= 60 ? `${Math.ceil(s / 60)} min` : `${Math.max(1, Math.round(s))} s`);
+const trialWarning = (size) => { const n = TRIAL_AT_ONCE[size] ?? 2; return `trial: this sandbox is deleted 1 h after it starts (even when paused) and ${n} ${n === 1 ? "runs" : "run"} at once — \`lzs pull\` your work before then. Upgrade to Pro: ${PRICING}`; };
+
+// A refusal that comes from the account's plan (or its trial, or no plan yet), in plain words:
+// { kind, why, next: [lines] }. null for anything else.
+function planRefusal(err) {
+  const code = String(err?.code ?? ""), b = err?.body && typeof err.body === "object" ? err.body : {};
+  const tier = typeof b.tier === "string" ? b.tier : "";
+  const num = (x) => (typeof x === "number" && Number.isFinite(x) ? x : null);
+  if (/^TRIAL_/.test(code) || (code === "SANDBOX_SIZE_NOT_ALLOWED" && tier === "trial")) {
+    const size = sizeName(b.size), n = num(b.sizeLimit) ?? num(b.mediumLimit);
+    const why = {
+      TRIAL_SIZE_RUNNING: `the trial runs ${n ?? "a few"} ${size} at a time, and ${n === 1 ? "it is" : "they are"} already running`,
+      TRIAL_MEDIUM_RUNNING: `the trial runs ${n ?? 1} Medium at a time, and it is already running`,
+      TRIAL_STARTS_USED: `the trial starts at most ${num(b.totalStarts) ?? "a set number of"} ${size} sandboxes in all, and they are used up (paused ones still resume)`,
+      TRIAL_SANDBOX_LIFETIME: "trial sandboxes are deleted 1 hour after they start",
+      TRIAL_SANDBOX_REGION: `the trial runs in US regions only${b.region ? ` (not ${oneLine(b.region)})` : ""}`,
+      TRIAL_SANDBOX_SIZE: `${size} is not on the trial (it runs ${Array.isArray(b.allowedSizes) && b.allowedSizes.length ? b.allowedSizes.map(sizeName).join(", ") : "Nano, Mini and Small"}; lzs init --size nano builds a Nano base)`,
+      SANDBOX_SIZE_NOT_ALLOWED: "that size is not on the trial (lzs init --size nano builds a Nano base)",
+    }[code] ?? `trial limit: ${err.message}`;
+    const free = /RUNNING$/.test(code) ? [FREE_ONE] : [];
+    return { kind: "trial", why, next: [...free, UPGRADE_TRIAL] };
   }
+  if (code === "SANDBOX_RATE_LIMITED") {
+    const lim = num(b.limit), retry = num(b.retryAfterS);
+    const detail = [lim != null && b.window ? `${lim} starts per ${oneLine(b.window)}` : "", retry != null ? `try again in ${waitText(retry)}` : ""].filter(Boolean).join("; ");
+    return { kind: "rate", why: `starting too fast for your plan${detail ? ` (${detail})` : ""}`, next: [tier === "trial" ? UPGRADE_TRIAL : `Pro has no start limits: ${PRICING}`] };
+  }
+  if (code === "WORKSPACE_SANDBOX_LIMIT") {
+    // The workspace owner's own cap (lizard.build workspace limits), not the plan's.
+    return { kind: "workspace", why: `the workspace's own limit${num(b.limit) != null ? ` of ${b.limit} sandboxes at once` : ""} is reached (its owner sets it)`, next: [FREE_ONE] };
+  }
+  if (code === "SANDBOX_LIMIT_REACHED" || (err?.status === 429 && !code)) {
+    const lim = num(b.limit), running = num(b.running);
+    let why = "limit reached";
+    if (b.unit === "vcpu" && lim != null) why += running != null ? `: ${running} of ${lim} vCPU in use on your plan (a Nano agent counts as 1)` : `: your plan runs up to ${lim} vCPU at once (a Nano agent counts as 1)`;
+    else if (lim != null) why += running != null ? `: ${running} of ${lim} sandboxes running on your plan` : `: your plan runs up to ${lim} sandboxes at once`;
+    else why += `: ${err.message}`;
+    const next = [FREE_ONE];
+    if (tier === "trial") next.push(UPGRADE_TRIAL);
+    else if (tier === "pro") next.push(`Pro $99 runs 220 agents at once: ${PRICING}`);
+    // Pay-as-you-go runs as many at once as Pro $19 (40), so only Pro $99 gives more.
+    else if ((tier === "topup" || tier === "scale") && b.unit === "vcpu") next.push(`Pro $99 runs 220 agents at once, with no start limits: ${PRICING}`);
+    else if (!tier && !/workspace already has/i.test(err.message ?? "")) next.push(UPGRADE);
+    return { kind: "concurrent", why, next };
+  }
+  if (err?.status === 402 || code === "PAYMENT_REQUIRED" || b.error === "INSUFFICIENT_CREDITS") {
+    if (b.status === "trial_available") return { kind: "payment", why: "this account has no plan yet", next: [START_TRIAL] };
+    if (b.status === "subscription_required") return { kind: "payment", why: "this account has no active plan", next: [`Start Pro ($19/month): ${PRICING}`] };
+    return { kind: "payment", why: oneLine(b.message || err.message || "payment required"), next: [] };
+  }
+  return null;
+}
+
+// Lizard said no to a new sandbox: say what the limit is and how to get under it.
+// `limit`: a plan limit (exit EXIT_LIMIT, so lzs fan stops starting more).
+function refusal(err, what = "a new sandbox") {
+  const p = planRefusal(err);
+  if (p) return { limit: true, kind: p.kind, text: `Lizard refused ${what}: ${p.why.replace(/[.\s]+$/, "")}.${p.next.map((l) => `\n  ${l}`).join("")}` };
   return { limit: false, text: `Lizard refused ${what}: ${err?.message ?? "unknown error"}` };
 }
 
@@ -316,7 +382,7 @@ function lizardWs() {
 
 // Runs a line in the sandbox's terminal (the one lizard.build and `lizard sandbox ssh` open).
 // Unlike exec, that terminal starts with the agent logins you connected on Lizard (the
-// project's Agents page, or `lizard agents login claude`), so this is how a base picks them up.
+// project's Agents page, or `lizard agents add claude -p <project>`), so this is how a base picks them up.
 async function terminalLine(id, line, timeoutMs = 20000) {
   const WebSocket = lizardWs();
   const token = lizardToken();
@@ -744,7 +810,7 @@ async function otherMembers(project) {
   return [...others.values()];
 }
 
-// Which Lizard-connected logins this project has (Agents page / `lizard agents login`).
+// Which Lizard-connected logins this project has (Agents page / `lizard agents add|login`).
 function connectedKinds(project) {
   const r = lizard(["agents", "status", "--project", project], { json: true, check: false });
   return (r?.credentials ?? []).filter((c) => c.connected).map((c) => c.kind);
@@ -861,7 +927,7 @@ j.skipDangerousModePermissionPrompt=true;j.env={...(j.env||{}),DISABLE_AUTOUPDAT
     // The terminal carries the Lizard-connected logins: keep the agent ones in the base.
     const t = await terminalLine(id, `env | grep -E '^(${LOGIN_VARS})=' > ${REMOTE}/agent-env.raw; chmod 600 ${REMOTE}/agent-env.raw`);
     const r = remote(id, `cd ${REMOTE} && n=0; [ -f agent-env.raw ] && while IFS='=' read -r k v; do [ -n "$k" ] && printf '%s=%q\\n' "$k" "$v" >> agent.env && n=$((n+1)); done < agent-env.raw; rm -f agent-env.raw; echo $n`, { check: false });
-    if (!t.ok || !(Number(r.stdout.trim()) > 0)) say(`no login came from Lizard for ${project.name}: logins connected on Lizard belong to one project (lizard agents -p ${project.name} add …, or the project's Agents page)`);
+    if (!t.ok || !(Number(r.stdout.trim()) > 0)) say(`no login came from Lizard for ${project.name}: logins connected on Lizard belong to one project (lizard agents add claude -p ${project.name} with a token from claude setup-token, or the project's Agents page)`);
   }
   // Codex wants an API key as a login of its own.
   remote(id, `set -a; . ${REMOTE}/agent.env; set +a; [ -n "\${OPENAI_API_KEY:-}" ] && command -v codex >/dev/null && [ ! -s /root/.codex/auth.json ] && printenv OPENAI_API_KEY | codex login --with-api-key >/dev/null 2>&1; true`, { check: false });
@@ -1169,8 +1235,12 @@ async function newSession({ name, agent, prompt, repo, pack, attach, check, grou
   if (!made.ok) { const rf = refusal(made.error, `a sandbox for ${name}`); die(rf.text, rf.limit ? EXIT_LIMIT : 1); }
   const sb = made.data;
   recordCreated("sandboxes", sb.id);
+  // Asked for no lifetime (--timeout 0): a lifetime anyway means the trial, which gives every
+  // sandbox 1 hour. Said once per session start (lzs fan says it once for all of them).
+  const trial = !!(sb.expiresAt || sb.endAt);
+  if (trial) warnLoud(trialWarning(cfg.size));
   const now = new Date().toISOString();
-  const rec = { v: 5, id: sb.id, agent, snapshot: cfg.snapshot, createdAt: now, wokeAt: now, ...(prompt ? { prompt: trunc(prompt, 200) } : {}), ...(check ? { check } : {}), ...(group ? { group } : {}), ...(flags["max-hours"] ? { maxHours: Number(flags["max-hours"]) } : {}), ...(flags["idle-minutes"] !== undefined ? { idleMinutes: Number(flags["idle-minutes"]) } : {}) };
+  const rec = { v: 5, id: sb.id, agent, snapshot: cfg.snapshot, createdAt: now, wokeAt: now, ...(trial ? { expiresAt: sb.expiresAt ?? sb.endAt } : {}), ...(prompt ? { prompt: trunc(prompt, 200) } : {}), ...(check ? { check } : {}), ...(group ? { group } : {}), ...(flags["max-hours"] ? { maxHours: Number(flags["max-hours"]) } : {}), ...(flags["idle-minutes"] !== undefined ? { idleMinutes: Number(flags["idle-minutes"]) } : {}) };
   updateSessions((all) => { all[name] = rec; });
   let cwd = "/workspace", setup = "";
   if (repo?.kind === "local") {
@@ -1279,29 +1349,38 @@ async function cmdFan(rest, flags) {
   // environment, never on a command line.
   const env = { ...process.env, ...(flags["github-token"] ? { LZS_GH_TOKEN: flags["github-token"] } : {}) };
   const args = (nm) => ["new", ...(repo?.kind === "local" ? [repo.dir, "--pack", pack.stage] : []), ...(repo?.kind === "github" ? ["--repo", repo.slug] : []), "--name", nm, "--detach", "--yes", "--group", group, "--agent", agent, "--prompt", flags.prompt, ...(flags.check ? ["--check", flags.check] : []), ...(flags["max-hours"] ? ["--max-hours", flags["max-hours"]] : []), ...(flags["idle-minutes"] !== undefined ? ["--idle-minutes", flags["idle-minutes"]] : []), ...(flags["no-idle-pause"] ? ["--no-idle-pause"] : []), ...(flags["no-github"] ? ["--no-github"] : [])];
-  let limited = null;
+  let limited = null, trialSeen = false;
   const results = await pool(names, 10, (nm) => new Promise((resolve) => {
     if (limited) { console.error(`  ${dim("-")} ${nm}: not started (limit)`); return resolve(false); }
     const p = spawn(process.execPath, [process.argv[1], ...args(nm)], { stdio: ["ignore", "ignore", "pipe"], env });
     let err = ""; p.stderr.on("data", (d) => (err += d));
     p.on("close", (code) => {
       const took = (err.match(/ready in ([\d.]+) s/) ?? [])[1];
-      if (code === EXIT_LIMIT && !limited) limited = safeText(err).trim().split("\n").filter(Boolean).slice(-2).join("\n  ");
-      console.error(code === 0 ? `  ${green("✓")} ${nm}${took ? dim(` ${took} s`) : ""}` : `  ${red("✗")} ${nm}: ${code === EXIT_LIMIT ? "limit reached" : safeText(err).trim().split("\n").slice(-2).join(" ")}`);
+      if (/trial: this sandbox is deleted/.test(err)) trialSeen = true;
+      if (code === EXIT_LIMIT && !limited) {
+        // The refusal and its follow-up lines, from the last "lzs: " line on.
+        const lines = safeText(err).trim().split("\n").filter(Boolean);
+        const k = lines.findLastIndex((l) => /^lzs: /.test(l));
+        limited = lines.slice(k >= 0 ? k : -2).join("\n");
+      }
+      console.error(code === 0 ? `  ${green("✓")} ${nm}${took ? dim(` ${took} s`) : ""}` : `  ${red("✗")} ${nm}: ${code === EXIT_LIMIT ? (/starting too fast/.test(err) ? "start limit" : "refused (plan limit)") : safeText(err).trim().split("\n").slice(-2).join(" ")}`);
       resolve(code === 0);
     });
   }));
   if (pack) rmTmp(pack.stage);
   const ok = results.filter(Boolean).length;
-  if (limited) console.error(`\n${red("lzs: ")}${limited.replace(/^lzs: /, "")}`);
+  if (limited) console.error(`\n${red("lzs: ")}${limited.replace(/^lzs: /, "")}${/starting too fast/.test(limited) ? `\n  started ${ok} of ${n} before the start limit` : ""}`);
+  if (trialSeen) warnLoud(trialWarning(cfg.size));
   console.error(`\n${ok} of ${n} running after ${secs(t0)} s · ${bold("lzs watch")} to follow them${flags.check ? `; each runs ${bold(safeText(flags.check))} when it finishes` : ""} · ${bold("lzs diff")} to compare · ${bold("lzs pick <name>")} to keep the best`);
   return ok === n ? 0 : limited ? EXIT_LIMIT : 1;
 }
 
-async function wake(name, v, live, { agent = true } = {}) {
+// soft: throw instead of exiting when Lizard refuses the resume (lzs rm deletes it anyway).
+async function wake(name, v, live, { agent = true, soft = false } = {}) {
   if (live?.status === "paused" || live?.status === "pausing") {
     const t0 = Date.now();
-    lizard(["sandbox", "resume", v.id]);
+    const res = lizardTry(["sandbox", "resume", v.id]);
+    if (!res.ok) { const rf = refusal(res.error, `to resume ${name}`); if (soft) throw new Error(rf.text.split("\n")[0]); die(rf.text, rf.limit ? EXIT_LIMIT : 1); }
     if (agent) remote(v.id, `${REMOTE}/start.sh ${bv(v.agent)} continue`);
     updateSessions((all) => { if (all[name]) all[name].wokeAt = new Date().toISOString(); });
     v.wokeAt = new Date().toISOString();
@@ -1705,7 +1784,7 @@ async function cmdRm(refs, flags) {
     const l = live.get(v.id);
     // Its conversations first: a paused one is woken for that (without starting the agent).
     if (l && !flags["no-sync"] && cfg.sync !== false) {
-      try { await wake(name, v, l, { agent: false }); await syncTranscripts(name, v, cfg, flags); } catch {}
+      try { await wake(name, v, l, { agent: false, soft: true }); await syncTranscripts(name, v, cfg, flags); } catch (e) { say(`${name}: transcripts not brought back (${oneLine(e.message)})`); }
     }
     const res = await lizardAsync(["sandbox", "rm", v.id, "--yes"], { timeoutMs: 60000 });
     if (res.status !== 0 && !/not found/i.test(lizardError(res))) { say(`${name}: could not delete ${v.id} (${lizardError(res)}); kept in lzs ls`); return; }

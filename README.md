@@ -172,15 +172,18 @@ That's **42× cheaper** with CPU maxed out. A typical agent mostly waits on the 
 
 ### How many agents at once
 
-**Runs on Pro ($19/mo): up to 40 agents at once on Nano.** Need more? Pro $99 runs 200+ (220).
+**Runs on Pro ($19/mo): up to 40 agents at once on Nano.** Need more? Pro $99 runs 220.
 
-| Plan | Agents at once (Nano) |
-|---|---|
-| **Pro $19/month** (or pay-as-you-go) | **40** |
-| Pro $99/month | 220 |
-| 7-day trial (card required) | 2, each deleted after 1 hour (see [Known limitations](#known-limitations)) |
+| Plan | Agents at once (Nano) | Start limits |
+|---|---|---|
+| **Pro $19/month** | **40** | none |
+| Pro $99/month | 220 | none |
+| Pay-as-you-go | 40 | 12 starts a minute (24 once you've paid $20 in total) |
+| 7-day trial (card required) | 2, each deleted 1 hour after it starts, US regions only (see [Known limitations](#known-limitations)) | 6 starts a minute |
 
-Limits count vCPU, and a Nano session counts as 1. When you hit the limit, lzs says so (how many run, the limit) and `lzs fan` stops starting more. `lzs stop` / `lzs rm` free a slot.
+Upgrade to Pro for more agents at once and no start limits: https://lizard.build/pricing
+
+Limits count vCPU, and a Nano session counts as 1. When you hit a limit, lzs says which one (how many run, the limit, or starting too fast) and what lifts it, and `lzs fan` stops starting more. `lzs stop` / `lzs rm` free a slot.
 
 ## Requirements
 
@@ -192,7 +195,7 @@ Limits count vCPU, and a Nano session counts as 1. When you hit the limit, lzs s
 
 ## Known limitations
 
-- **Trial accounts can't run `lzs init` yet.** lzs makes sandboxes that live until they pause, and trial sandboxes are capped at 1 hour. Add credit or start a plan first.
+- **On the trial, every sandbox is deleted 1 hour after it starts**, even when paused, and 2 run at once (US regions only). lzs warns when a session starts on the trial: `lzs pull` your work before the hour is up. Upgrade to Pro (first payment ends the trial limits): https://lizard.build/pricing
 - **Sessions need an API-key login.** After a plain `lizard login`, starting a session fails with "`--with-token` expects a liz_ API key". Sign in with a key from `lizard keys create` ([Setup, step 2](#setup)).
 
 ## Security model
@@ -292,7 +295,9 @@ You're signed in to `lizard` with the browser login. Create a key with `lizard k
 <details>
 <summary><b>"Lizard refused a sandbox: limit reached"</b></summary>
 
-You're at your plan's limit of agents at once ([table above](#how-many-agents-at-once)). `lzs ls` shows what's running; `lzs stop <name>` pauses one, `lzs rm <name>` deletes one.
+You're at your plan's limit of agents at once ([table above](#how-many-agents-at-once)). `lzs ls` shows what's running; `lzs stop <name>` pauses one, `lzs rm <name>` deletes one. "Starting too fast for your plan" is the start limit instead: wait a minute, or move to Pro, which has none.
+
+Upgrade to Pro for more agents at once and no start limits: https://lizard.build/pricing
 
 </details>
 
