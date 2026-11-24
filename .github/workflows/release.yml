@@ -23,6 +23,8 @@ jobs:
         run: |
           V=$(node -p "require('./package.json').version")
           if git ls-remote --tags origin "refs/tags/v$V" | grep -q .; then echo "v$V already released"; exit 0; fi
+          # The first release is published by hand (npm trusted publishing needs the package to exist).
+          if ! npm view @lizard-build/lzs version >/dev/null 2>&1; then echo "::notice::@lizard-build/lzs is not on npm yet: publish the first version by hand"; exit 0; fi
           npm install -g npm@latest
           npm publish --access public --provenance
           git tag "v$V" && git push origin "v$V"
