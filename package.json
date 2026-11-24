@@ -1,6 +1,6 @@
 {
   "name": "@lizard-build/lzs",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Run coding agents (Claude Code, Codex, OpenCode) in Lizard sandboxes: one command per session, keeps going when your laptop sleeps, pauses itself when idle.",
   "type": "module",
   "bin": {

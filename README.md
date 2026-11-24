@@ -44,12 +44,13 @@ Start
   lzs init [--agent claude|codex|opencode] [--size nano|mini|small] [--github]
            [--notify URL] [--idle-minutes 30] [--project P]  build your base snapshot (once)
   lzs [. | DIR | --repo owner/name] [-p "task"] [-d]         a fresh session (. = this repo)
-  lzs fan N [. | --repo owner/name] -p "task" [--check CMD]  N agents on one task; CMD (your tests)
-                                                             runs in each one when it finishes
+  lzs fan N [. | DIR | --repo owner/name] -p "task" [--check CMD]
+                                                             N agents on one task, in the background;
+                                                             CMD (your tests) runs in each when done
   lzs group N [.] [-p "task"]                                N sessions side by side (inside tmux)
 
 Follow
-  lzs ls                                                     every session: working, your turn, asking
+  lzs ls [--json]                                            every session: working, your turn, asking
   lzs watch                                                  the same, live; a bell when one needs you
   lzs peek <name>                                            its screen, without attaching
   lzs send <name> "text" | --all "text"                      type into the agent without attaching
@@ -59,16 +60,17 @@ Compare
   lzs diff                                                   the last fan-out side by side
   lzs diff <name> [--stat]                                   one session's diff
   lzs check [name...] [--check CMD]                          run the check now, everywhere at once
-  lzs pick <name>                                            keep it (as a branch), delete the rest
+  lzs pick <name> [--yes] [--keep]                           keep it (as a branch), delete the rest
 
 Ship
-  lzs pull <name>                                            the work as branch lzs/<name> in your repo
+  lzs pull <name> [--files] [--to DIR]                       the work as branch lzs/<name> in your repo
   lzs push <name>                                            push that branch and open a pull request
   lzs open <name> <port>                                     a URL for a dev server in the session
 
 Tidy
   lzs stop <name> | --all                                    pause now (files kept, billing stops)
   lzs rm <name> | --all                                      delete
+  lzs uninstall [--yes]                                      delete everything lzs made (below)
 ```
 
 Inside a session: `Ctrl-b d` detaches (the agent keeps working), `Ctrl-b c` opens a shell next to it.
@@ -83,6 +85,22 @@ lzs-4     paused      claude           shop · Add retry to payment webhook
 
 4 sessions · 3 running · ~$0.012/h (nano) · 2 waiting for you
 ```
+
+## Flags you'll want (scripts, CI, first run)
+
+- `-p "task"` gives the agent its task; `lzs fan` requires it (a task without `-p` is an error).
+- `-d` starts a session without attaching. Without a terminal (a script, CI, another agent) that
+  is what happens anyway; `lzs fan` never attaches. Then `lzs peek <name>` shows the screen and
+  `lzs send <name> "…"` types into it.
+- `lzs ls --json` for scripts.
+- `lzs pick <name> --yes` deletes the other attempts without asking (without a terminal and
+  without `--yes` they are kept); `--keep` keeps them. A session with no changes is not picked
+  without `--force`, and never deletes the others.
+- `lzs pull <name> --files --to DIR` copies `/workspace` instead of making a branch.
+- `lzs rm --all` deletes the sessions but keeps your base snapshot (`lzs-base`) and the
+  project-scoped API key `lzs-<project>` that lets sandboxes pause themselves. `lzs uninstall`
+  deletes those too, plus `~/.config/lzs` (`--yes` to skip the question). It deletes only what
+  this machine's lzs made, by id.
 
 ## Signing in
 
