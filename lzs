@@ -227,7 +227,7 @@ const WATCHDOG_SH = String.raw`#!/bin/bash
 L=/root/.lzs
 [ -f $L/env ] && set -a && . $L/env && set +a
 idle_min="\${LZS_IDLE_MINUTES:-30}"
-last=$(date +%s); prev=""; was=""; worked=0
+last=$(date +%s); prev=""; was=""; worked=0; tick=0; checked=""
 
 notify() { # $1 title, $2 text
   local u="\${LZS_NOTIFY:-}"; [ -z "$u" ] && return 0
@@ -247,8 +247,10 @@ run_check() { # writes check.rc / check.log / check.at; returns the exit code
   local rc=$?; echo $rc > $L/check.rc; date +%s > $L/check.at; return $rc
 }
 
-while sleep 10; do
-  now=$(date +%s)
+tree() { ( cd "$(cat $L/cwd 2>/dev/null || echo /workspace)" && { git rev-parse HEAD; git status --porcelain; git diff; } 2>/dev/null | md5sum ); }
+
+while sleep 2; do
+  now=$(date +%s); tick=$((tick + 1))
   screen=$(tmux capture-pane -p -t agent 2>/dev/null)
   cur=$(printf '%s' "$screen" | md5sum)
   [ "$cur" != "$prev" ] && last=$now && prev="$cur"
@@ -260,16 +262,22 @@ while sleep 10; do
   if printf '%s' "$tail" | grep -qiE 'esc to interrupt|esc interrupt|ctrl\+c to interrupt'; then state=working
   elif printf '%s' "$tail" | grep -qE 'Do you want|\(y/n\)|\[Y/n\]|❯ [0-9]+\.'; then state=asking
   else state=idle; fi
-  if [ "$state" = working ]; then worked=$((worked + 1)); fi
+  if [ "$state" = working ]; then worked=$((worked + 1)); touch $L/worked; fi
   if [ "$was" = working ] && [ "$state" != working ] && [ $worked -ge 1 ]; then
     title=$(tmux display -p -t agent '#{pane_title}' | sed 's/^[^[:alnum:]]*//')
     msg="$(cat $L/name) is done"; [ "$state" = asking ] && msg="$(cat $L/name) is asking you something"
     if [ -s $L/check ]; then
+      checked=$(tree)
       if run_check; then msg="$msg - check passed"; else msg="$msg - check FAILED"; fi
       last=$(date +%s)
     fi
     notify "$msg" "\${title:-$(cat $L/prompt 2>/dev/null | head -c 200)}"
     worked=0
+  fi
+  # The code changed since the last check while nobody is working (a turn too short to see,
+  # or edits by hand): check again, quietly.
+  if [ -s $L/check ] && [ "$state" != working ] && [ -f $L/worked ] && [ $((tick % 5)) = 0 ]; then
+    t=$(tree); if [ "$t" != "$checked" ] && [ "$was" != working ]; then checked=$t; run_check; last=$(date +%s); fi
   fi
   was=$state
 
@@ -299,6 +307,7 @@ if [ -n "$cwd" ] && [ -d "$cwd/.git" ] && [ -f $L/base ]; then
   echo "GIT $(git rev-list --count $(cat $L/base)..HEAD 2>/dev/null || echo 0) $(n insertion) $(n deletion) 0 $(n file)"
 fi
 [ -f $L/check.rc ] && echo "CHECK $(cat $L/check.rc) $(cat $L/check.at 2>/dev/null || echo 0)"
+[ -f $L/worked ] && echo "WORKED 1"
 echo "SCREEN"
 tmux capture-pane -p -t agent | sed -e 's/[[:space:]]*$//' | grep -v '^$' | tail -25
 `;
@@ -336,7 +345,7 @@ function parseProbe(out) {
     const said = screen.split("\n").filter((l) => /^\s*(⏺|•|●)\s+\S/.test(l)).at(-1);
     title = said ? said.replace(/^\s*(⏺|•|●)\s+/, "") : "";
   }
-  return { state: classify(screen), title, idleS: last && now ? now - last : null, git, check, screen };
+  return { state: classify(screen), worked: /^WORKED 1$/m.test(out), title, idleS: last && now ? now - last : null, git, check, screen };
 }
 
 async function probeAll(entries, live) {
@@ -344,11 +353,14 @@ async function probeAll(entries, live) {
     const status = live.get(v.id)?.status ?? "gone";
     if (status !== "running") return { name, v, status, state: status };
     const r = await remoteAsync(v.id, PROBE_SH, { timeoutMs: 15000 });
-    return { name, v, status, ...(r.status === 0 ? parseProbe(r.stdout) : { state: "unreachable" }) };
+    const p = r.status === 0 ? parseProbe(r.stdout) : { state: "unreachable" };
+    // Given a task but not at it yet: the agent is still starting up.
+    if (v.prompt && p.state === "waiting" && !p.worked && Date.now() - Date.parse(v.createdAt) < 120000) p.state = "starting";
+    return { name, v, status, ...p };
   });
 }
 
-const STATE_COLOR = { working: cyan, waiting: green, asking: magenta, exited: yellow, paused: dim, pausing: dim, resuming: dim, gone: red, unreachable: red, "no agent": yellow };
+const STATE_COLOR = { starting: dim, working: cyan, waiting: green, asking: magenta, exited: yellow, paused: dim, pausing: dim, resuming: dim, gone: red, unreachable: red, "no agent": yellow };
 const STATE_LABEL = { waiting: "your turn", asking: "asking you" };
 
 // "+120 −30 · 2 new · 3 commits": what the session changed against where it started.
