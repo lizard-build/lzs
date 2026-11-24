@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // lzs: coding agents (Claude Code, Codex, OpenCode) in Lizard sandboxes, one command per session.
 //
-//   lzs init                     build your base snapshot once (agent login, skills, MCPs, tmux)
+//   lzs init --project P         build your base snapshot once (agent logins, skills, MCPs, tmux)
 //   lzs .                        this repo (uncommitted work too) in a fresh sandbox, agent attached
 //   lzs fan 10 . -p "task"       ten agents on the same task, in parallel, in the background
 //   lzs watch                    what every agent is doing; a bell when one needs you
@@ -9,87 +9,196 @@
 //
 // Everything goes through the `lizard` CLI (npm i -g @lizard-build/cli; `lizard login` once).
 // Each session is its own sandbox; the agent runs in tmux inside it, so it keeps working when your
-// laptop sleeps, and a watchdog inside pauses the sandbox once it has been idle for a while
-// (compute billing stops; files and the conversation stay; `lzs resume` wakes it in ~2.5 s).
+// laptop sleeps, and a watchdog inside pauses the sandbox once it has been idle for a while, or has
+// run for --max-hours (compute billing stops; files and the conversation stay).
+//
+// Security model (README "Security model" has the whole of it): the agent runs with its
+// permission prompts off, so treat whatever is in a session as able to do anything the session
+// can. lzs keeps your own secrets out of it: no GitHub login of yours, no long-lived Lizard key,
+// no .env files or .git/config from your repo, no MCP secrets unless you ask; and what comes back
+// (branches, files, transcripts, screen text) is handled as untrusted.
 
 import { spawnSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import zlib from "node:zlib";
 import readline from "node:readline/promises";
 import { createRequire } from "node:module";
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const HOME = os.homedir();
 const CFG_DIR = process.env.LZS_HOME || path.join(HOME, ".config", "lzs");
 const CFG_FILE = path.join(CFG_DIR, "config.json");
 const STATE_FILE = path.join(CFG_DIR, "sessions.json");
-// Every sandbox, snapshot and key lzs made, by id: `lzs uninstall` deletes exactly these.
+// Every sandbox, snapshot, key and project lzs made, by id: `lzs uninstall` deletes exactly these.
 const CREATED_FILE = path.join(CFG_DIR, "created.json");
 const REMOTE = "/root/.lzs";
+const CFG_VERSION = 5;
 const RATE = { nano: 0.00405, mini: 0.0081, small: 0.0162, medium: 0.0324, large: 0.0648, big: 0.1296 };
+const NAME_RE = /^[A-Za-z0-9._-]{1,40}$/;
+const SLUG_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+const EXIT_LIMIT = 75; // Lizard refused a sandbox: a limit, not a bug
+const FAN_MAX = 50, FAN_CONFIRM = 20;
 
 // How each agent starts fresh, starts with a first prompt, continues its last conversation,
-// gets installed, and reads its login.
+// gets installed, and which logins it can use.
 const AGENTS = {
   claude: {
-    install: "true", // in the claude template already
+    pkg: "@anthropic-ai/claude-code",
     start: "claude --dangerously-skip-permissions",
     prompt: "claude --dangerously-skip-permissions",
     cont: "claude --continue --dangerously-skip-permissions || claude --dangerously-skip-permissions",
-    env: ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
-    hint: "run `claude setup-token` on your machine and paste the token (one long-lived token is safe for many sessions at once)",
+    env: ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
+    files: [],
+    kinds: ["claude", "anthropic_key", "openrouter_key"],
+    hint: "run `claude setup-token` on your machine and set CLAUDE_CODE_OAUTH_TOKEN (one long-lived token is safe for many sessions at once), or connect Claude on Lizard: lizard agents login claude",
   },
   codex: {
-    install: "command -v codex >/dev/null || npm i -g @openai/codex >/dev/null 2>&1",
+    pkg: "@openai/codex",
     start: "codex --dangerously-bypass-approvals-and-sandbox",
     prompt: "codex --dangerously-bypass-approvals-and-sandbox",
     cont: "codex resume --last --dangerously-bypass-approvals-and-sandbox || codex --dangerously-bypass-approvals-and-sandbox",
     env: ["OPENAI_API_KEY"],
-    hint: "paste an OpenAI API key, or leave it empty and run `codex login --device-auth` in the base shell",
+    files: ["/root/.codex/auth.json"],
+    kinds: ["openai_key", "chatgpt"],
+    hint: "set OPENAI_API_KEY, or connect an OpenAI key on Lizard (lizard agents login), or sign in by hand when lzs init opens the base shell (codex login --device-auth)",
   },
   opencode: {
-    install: "command -v opencode >/dev/null || npm i -g opencode-ai >/dev/null 2>&1",
+    pkg: "opencode-ai",
     start: "opencode",
     prompt: "opencode --prompt",
     cont: "opencode --continue || opencode",
-    env: ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
-    hint: "paste a provider API key, or leave it empty and run `opencode auth login` in the base shell",
+    env: ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY", "MOONSHOT_API_KEY"],
+    files: ["/root/.local/share/opencode/auth.json"],
+    kinds: ["anthropic_key", "openai_key", "openrouter_key", "deepseek_key", "moonshot_key"],
+    hint: "set a provider API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY), connect one on Lizard, or run `opencode auth login` when lzs init opens the base shell (a Claude subscription token does not work for OpenCode)",
   },
 };
+// Logins the Lizard terminal carries that an agent can use (`lzs init` copies them into the base).
+const LOGIN_VARS = "CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|OPENAI_API_KEY|OPENROUTER_API_KEY|MOONSHOT_API_KEY|DEEPSEEK_API_KEY";
+
+// ---------- terminal-safe text ----------
+// Text from a sandbox is written by whatever runs there (the agent, a repo it read). Before it
+// reaches your terminal it loses every escape sequence (titles, OSC 52 clipboard writes,
+// hyperlinks, cursor moves) and control character; safeSgr keeps colors (SGR) and nothing else.
+const ESC_SEQ = /\x1b\[[0-?]*[ -\/]*[@-~]|\x9b[0-?]*[ -\/]*[@-~]|\x1b\][\s\S]*?(?:\x07|\x1b\\|\x9c)|\x9d[\s\S]*?(?:\x07|\x1b\\|\x9c)|\x1b[PX^_][\s\S]*?(?:\x1b\\|\x9c)|\x1b[ -\/]*[0-~]/g;
+const CTRL = /[\x00-\x08\x0b-\x1f\x7f-\x9f]/g; // keeps \t and \n
+const safeText = (s) => String(s ?? "").replace(ESC_SEQ, "").replace(CTRL, "");
+const safeSgr = (s) => String(s ?? "").replace(ESC_SEQ, (m) => (/^\x1b\[[0-9;:]*m$/.test(m) ? m : "")).replace(/[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f-\x9f]/g, "").replace(/\x1b(?!\[[0-9;:]*m)/g, "");
+const oneLine = (s) => safeText(s).replace(/\s+/g, " ").trim();
 
 // ---------- small helpers ----------
 const tty = process.stdout.isTTY;
 const c = (n) => (s) => (tty ? `\x1b[${n}m${s}\x1b[0m` : String(s));
 const dim = c(2), bold = c(1), green = c(32), red = c(31), yellow = c(33), cyan = c(36), magenta = c(35);
-const say = (m) => console.error(dim("lzs ") + m);
-const die = (m, code = 1) => { console.error(red("lzs: ") + m); process.exit(code); };
-const readJson = (f, d) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return d; } };
-const writeJson = (f, v) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, JSON.stringify(v, null, 2) + "\n", { mode: 0o600 }); };
-const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-const b64 = (s) => Buffer.from(s).toString("base64");
+const say = (m) => console.error(dim("lzs ") + safeSgr(m));
+const warnLoud = (m) => console.error(`${yellow(bold("lzs warning:"))} ${safeSgr(m)}`);
+const die = (m, code = 1) => { console.error(red("lzs: ") + safeSgr(m)); process.exit(code); };
+const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`; // local shell (tmux) only
+const b64 = (s) => Buffer.from(String(s ?? "")).toString("base64");
+// A value inside an embedded bash script: it travels base64 and is decoded in place, so nothing
+// in it (quotes, $(...), newlines) is ever parsed by the shell.
+const bv = (s) => `"$(printf %s ${b64(s)} | base64 -d)"`;
 const secs = (t0) => ((Date.now() - t0) / 1000).toFixed(1);
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 const plain = (s) => String(s).replace(/\x1b\[[0-9;]*m/g, "");
-// Every terminal escape (colors, cursor moves, titles), for output that is not a terminal.
-const noAnsi = (s) => String(s).replace(/\x1b\[[0-?]*[ -\/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>78]/g, "");
 const plural = (n, w, ws = w + "s") => `${n} ${n === 1 ? w : ws}`;
 const interactive = () => !!(process.stdin.isTTY && process.stdout.isTTY);
-// The few words a lizard error is about, never its raw JSON.
-function lizardError(r) {
-  const txt = `${r.stdout || ""}\n${r.stderr || ""}`.trim();
-  const m = txt.match(/\{[\s\S]*\}/);
-  if (m) {
-    try {
-      const e = JSON.parse(m[0]).error;
-      if (e) return String(typeof e === "string" ? e : e.message || e.body?.error || e.code || "unknown error").trim();
-    } catch {}
-  }
-  return txt.split("\n").filter((l) => !/^For AI agents/.test(l)).join("\n").trim().slice(-1500) || `exit code ${r.status}`;
-}
-// Shorten to n visible characters; colored text that doesn't fit loses its colors.
 const trunc = (s, n) => { const p = plain(s); return p.length <= n ? s : p.slice(0, n - 1) + "…"; };
+const redact = (s) => (s ? `${String(s).slice(0, 4)}…` : "");
 
+// ---------- temporary files and cleanup ----------
+// Every temporary directory lzs makes is removed when it exits, however it exits (die(), Ctrl-C,
+// a signal); cleanups run first (e.g. deleting a half-built base sandbox).
+const tmpDirs = new Set();
+const cleanups = [];
+function mkTmp() {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "lzs-"));
+  fs.chmodSync(d, 0o700);
+  tmpDirs.add(d);
+  return d;
+}
+function rmTmp(d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} tmpDirs.delete(d); }
+process.on("exit", () => {
+  for (const f of cleanups.splice(0).reverse()) { try { f(); } catch {} }
+  for (const d of [...tmpDirs]) rmTmp(d);
+});
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => process.exit(sig === "SIGINT" ? 130 : 143));
+
+// ---------- local state ----------
+const ensureDir = (d) => { fs.mkdirSync(d, { recursive: true, mode: 0o700 }); try { fs.chmodSync(d, 0o700); } catch {} };
+// Missing = the default; unreadable JSON = stop, never overwrite: these files are the only record
+// of which sandboxes, snapshots and keys lzs made.
+function readState(f, d) {
+  let txt;
+  try { txt = fs.readFileSync(f, "utf8"); } catch (e) { if (e.code === "ENOENT") return d; throw e; }
+  try { return JSON.parse(txt); } catch (e) { die(`${f} is not valid JSON (${e.message}). lzs will not overwrite it: fix it, or move it away (it records what lzs made on Lizard; lzs uninstall reads it).`); }
+}
+function writeJson(f, v) {
+  ensureDir(path.dirname(f));
+  const tmp = `${f}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(v, null, 2) + "\n", { mode: 0o600 });
+  fs.renameSync(tmp, f);
+}
+const readJsonLoose = (f, d) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return d; } };
+
+// A lock directory holding its owner's pid: broken only when that process is gone.
+function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } }
+function withLock(file, fn) {
+  const lock = file + ".lock";
+  ensureDir(path.dirname(file));
+  const t0 = Date.now();
+  for (;;) {
+    try {
+      fs.mkdirSync(lock, { mode: 0o700 });
+      fs.writeFileSync(path.join(lock, "pid"), String(process.pid), { mode: 0o600 });
+      break;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      let pid = 0;
+      try { pid = parseInt(fs.readFileSync(path.join(lock, "pid"), "utf8"), 10) || 0; } catch {}
+      let age = 0;
+      try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { continue; }
+      // No pid yet: its owner is writing it right now, or died before it could (then after 10 s).
+      const stale = pid ? !pidAlive(pid) : age > 10000;
+      if (stale) {
+        const aside = `${lock}.stale.${process.pid}.${Date.now()}`;
+        try { fs.renameSync(lock, aside); fs.rmSync(aside, { recursive: true, force: true }); } catch {}
+        continue;
+      }
+      if (Date.now() - t0 > 60000) die(`${lock} has been held by process ${pid || "?"} for a minute. If that process is not lzs, remove the directory.`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+  try { return fn(); } finally { fs.rmSync(lock, { recursive: true, force: true }); }
+}
+
+const config = () => readState(CFG_FILE, null);
+function needConfig() {
+  const cfg = config() ?? die("no base snapshot yet. Run: lzs init --project <name>");
+  if ((cfg.version ?? 0) < CFG_VERSION) die(`your base was made by an older lzs. Run lzs init --project ${cfg.projectName ?? cfg.projectId} again (0.5 keeps no Lizard key or GitHub login in the base; the old base is deleted once no session uses it)`);
+  return cfg;
+}
+const sessions = () => readState(STATE_FILE, {});
+const updateSessions = (fn) => withLock(STATE_FILE, () => { const s = sessions(); fn(s); writeJson(STATE_FILE, s); });
+const byAge = (s) => Object.entries(s).sort((a, b) => Date.parse(a[1].createdAt) - Date.parse(b[1].createdAt));
+const byName = (s) => Object.entries(s).sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }));
+
+// Remember (or forget) what lzs made on Lizard, as soon as it exists.
+function recordCreated(kind, id, add = true) {
+  if (!id) return;
+  withLock(CREATED_FILE, () => {
+    const made = readState(CREATED_FILE, {});
+    const list = new Set(made[kind] ?? []);
+    add ? list.add(id) : list.delete(id);
+    made[kind] = [...list];
+    writeJson(CREATED_FILE, made);
+  });
+}
+const created = () => readState(CREATED_FILE, {});
+
+// ---------- the lizard CLI ----------
 function lizard(args, { json = false, input, inherit = false, check = true } = {}) {
   const full = json ? [...args, "--json"] : args;
   const r = spawnSync("lizard", full, { encoding: "utf8", input, stdio: inherit ? "inherit" : ["pipe", "pipe", "pipe"], maxBuffer: 64 << 20 });
@@ -97,6 +206,44 @@ function lizard(args, { json = false, input, inherit = false, check = true } = {
   if (check && r.status !== 0) die(`lizard ${args.slice(0, 3).join(" ")} failed: ${lizardError(r)}`);
   if (!json) return r;
   try { return JSON.parse(r.stdout); } catch { die(`could not read the output of lizard ${args.slice(0, 3).join(" ")}: ${lizardError(r).slice(0, 500)}`); }
+}
+
+// The error a lizard command printed (with --json it is JSON on stdout), as plain words.
+function lizardErr(r) {
+  const txt = `${r.stdout || ""}\n${r.stderr || ""}`;
+  const m = txt.match(/\{[\s\S]*\}/);
+  if (m) {
+    try {
+      const e = JSON.parse(m[0]).error;
+      if (e) {
+        const body = typeof e === "object" ? e.body ?? {} : {};
+        return { code: body.code ?? e.code, status: e.status, message: oneLine(typeof e === "string" ? e : e.message || body.error || e.code || "unknown error"), body };
+      }
+    } catch {}
+  }
+  return { message: safeText(txt.split("\n").filter((l) => !/^For AI agents/.test(l)).join("\n").trim().slice(-1500)) || `exit code ${r.status}` };
+}
+const lizardError = (r) => lizardErr(r).message;
+
+// Run with --json and say how it went, without dying.
+function lizardTry(args) {
+  const r = lizard([...args, "--json"], { check: false });
+  let data = null;
+  try { data = JSON.parse(r.stdout); } catch {}
+  if (r.status === 0 && data && !data.error) return { ok: true, data };
+  return { ok: false, error: lizardErr(r) };
+}
+
+// Lizard said no to a new sandbox: say what the limit is and how to get under it.
+function refusal(err, what = "a new sandbox") {
+  const code = String(err?.code ?? "");
+  if (err?.status === 429 || /^SANDBOX_(LIMIT_REACHED|RATE_LIMITED)$/.test(code)) {
+    const b = err.body ?? {};
+    const counts = b.running != null && b.limit != null ? ` (${b.running} running, limit ${b.limit}${b.unit === "vcpu" ? " vCPU" : ""})` : b.limit != null ? ` (limit ${b.limit}${b.unit === "vcpu" ? " vCPU" : ""})` : "";
+    const free = code === "SANDBOX_RATE_LIMITED" ? "  wait a little and try again" : "  free one: lzs stop <name> pauses a session (lzs ls shows which run), lzs rm <name> deletes it";
+    return { limit: true, text: `Lizard refused ${what}: limit reached${counts}. ${err.message}\n${free}` };
+  }
+  return { limit: false, text: `Lizard refused ${what}: ${err?.message ?? "unknown error"}` };
 }
 
 // The same, without blocking: for asking many sandboxes at once.
@@ -112,7 +259,8 @@ function lizardAsync(args, { timeoutMs = 20000 } = {}) {
   });
 }
 
-// Run a bash script inside a sandbox. It travels base64-encoded, so no quoting surprises.
+// Run a bash script inside a sandbox. It travels base64-encoded, so no quoting surprises. Scripts
+// never carry secrets (those go as files, lizard sandbox files put), since argv is visible locally.
 const wrap = (script) => ["bash", "-lc", `echo ${b64(script)} | base64 -d | bash`];
 function remote(id, script, { check = true, inherit = false } = {}) {
   const r = lizard(["sandbox", "exec", id, "--", ...wrap(script)], { check: false, inherit });
@@ -120,30 +268,68 @@ function remote(id, script, { check = true, inherit = false } = {}) {
   return r;
 }
 const remoteAsync = (id, script, opts) => lizardAsync(["sandbox", "exec", id, "--", ...wrap(script)], opts);
+// A file from this machine into the sandbox, mode 600 (for secrets: never on a command line).
+function putFile(id, local, dest) {
+  lizard(["sandbox", "files", "put", id, local, dest]);
+  remote(id, `chmod 600 ${bv(dest)}`);
+}
+function putSecretText(id, text, dest) {
+  const d = mkTmp(), f = path.join(d, "f");
+  fs.writeFileSync(f, text, { mode: 0o600 });
+  try { putFile(id, f, dest); } finally { rmTmp(d); }
+}
 
 const shell = (id) => spawnSync("lizard", ["sandbox", "ssh", id], { stdio: "inherit" }).status ?? 1;
 
+// ---------- the Lizard API, for the two things the CLI has no command for ----------
+// The token goes only to the Lizard API (https, unless LZS_ALLOW_INSECURE_API=1 for a local dev server).
+function lizardApiBase() {
+  let u;
+  try { u = new URL(process.env.LIZARD_API_URL || "https://lizard.build"); } catch { die("LIZARD_API_URL is not a URL"); }
+  if (u.protocol !== "https:" && !process.env.LZS_ALLOW_INSECURE_API) die(`LIZARD_API_URL ${u.origin} is not https; lzs will not send your Lizard token there (LZS_ALLOW_INSECURE_API=1 to allow it)`);
+  return u;
+}
+function lizardToken() {
+  const dir = process.env.LIZARD_HOME ? path.join(process.env.LIZARD_HOME, ".lizard") : path.join(HOME, ".lizard");
+  const lzCfg = readJsonLoose(path.join(dir, "config.json"), {});
+  return process.env.LIZARD_TOKEN || process.env.LIZARD_API_KEY || lzCfg.credentials?.accessToken || die("the lizard CLI is not signed in. Run: lizard login");
+}
+async function apiGet(p) {
+  try {
+    const r = await fetch(new URL(p, lizardApiBase()), { headers: { Authorization: `Bearer ${lizardToken()}` }, redirect: "error", signal: AbortSignal.timeout(15000) });
+    return r.ok ? await r.json() : null;
+  } catch { return null; }
+}
+
+// The WebSocket client the lizard CLI ships with, loaded only from inside that package.
+function lizardWs() {
+  const bin = spawnSync(process.platform === "win32" ? "where" : "which", ["lizard"], { encoding: "utf8" }).stdout.trim().split("\n")[0];
+  if (!bin) die("the `lizard` CLI is not installed");
+  let dir = path.dirname(fs.realpathSync(bin));
+  for (let i = 0; i < 5 && readJsonLoose(path.join(dir, "package.json"), {}).name !== "@lizard-build/cli"; i++) dir = path.dirname(dir);
+  if (readJsonLoose(path.join(dir, "package.json"), {}).name !== "@lizard-build/cli") die(`could not find the @lizard-build/cli package behind ${bin}`);
+  const root = fs.realpathSync(dir) + path.sep;
+  const resolved = fs.realpathSync(createRequire(path.join(dir, "package.json")).resolve("ws"));
+  if (!resolved.startsWith(root)) die(`refusing to load 'ws' from ${resolved}: not inside the lizard CLI (${root})`);
+  return createRequire(path.join(dir, "package.json"))("ws");
+}
+
 // Runs a line in the sandbox's terminal (the one lizard.build and `lizard sandbox ssh` open).
 // Unlike exec, that terminal starts with the agent logins you connected on Lizard (the
-// project's Agents page, or `lizard agents login claude`), so this is how a base picks them
-// up without you pasting anything. Uses the WebSocket client the lizard CLI ships with.
+// project's Agents page, or `lizard agents login claude`), so this is how a base picks them up.
 async function terminalLine(id, line, timeoutMs = 20000) {
-  const bin = spawnSync(process.platform === "win32" ? "where" : "which", ["lizard"], { encoding: "utf8" }).stdout.trim().split("\n")[0];
-  const pkg = path.join(path.dirname(path.dirname(fs.realpathSync(bin))), "package.json");
-  const WebSocket = createRequire(pkg)("ws");
-  const lzCfg = readJson(path.join(process.env.LIZARD_HOME ? path.join(process.env.LIZARD_HOME, ".lizard") : path.join(HOME, ".lizard"), "config.json"), {});
-  const token = process.env.LIZARD_TOKEN || process.env.LIZARD_API_KEY || lzCfg.credentials?.accessToken;
-  if (!token) die("the lizard CLI is not signed in. Run: lizard login");
-  const base = new URL(process.env.LIZARD_API_URL || "https://lizard.build");
+  const WebSocket = lizardWs();
+  const token = lizardToken();
+  const base = lizardApiBase();
   base.protocol = base.protocol === "http:" ? "ws:" : "wss:";
   return new Promise((resolve) => {
-    const ws = new WebSocket(new URL(`/api/sandboxes/terminal?id=${encodeURIComponent(id)}`, base), { headers: { Authorization: `Bearer ${token}` } });
-    let sent = false, out = "";
-    const t = setTimeout(() => { try { ws.terminate(); } catch {} resolve({ ok: false, out }); }, timeoutMs);
+    const ws = new WebSocket(new URL(`/api/sandboxes/terminal?id=${encodeURIComponent(id)}`, base), { headers: { Authorization: `Bearer ${token}` }, followRedirects: false });
+    let sent = false;
+    const t = setTimeout(() => { try { ws.terminate(); } catch {} resolve({ ok: false }); }, timeoutMs);
     ws.on("open", () => ws.send(JSON.stringify({ type: "resize", cols: 200, rows: 50 })));
-    ws.on("message", (d) => { out += d.toString(); if (!sent) { sent = true; setTimeout(() => ws.send(Buffer.from(` ${line}; exit\r`), { binary: true }), 300); } });
-    ws.on("close", () => { clearTimeout(t); resolve({ ok: sent, out }); });
-    ws.on("error", () => { clearTimeout(t); resolve({ ok: false, out }); });
+    ws.on("message", () => { if (!sent) { sent = true; setTimeout(() => ws.send(Buffer.from(` ${line}; exit\r`), { binary: true }), 300); } });
+    ws.on("close", () => { clearTimeout(t); resolve({ ok: sent }); });
+    ws.on("error", () => { clearTimeout(t); resolve({ ok: false }); });
   });
 }
 
@@ -154,8 +340,62 @@ async function pool(items, n, fn) {
   return out;
 }
 
-const BOOL_FLAGS = new Set(["yes", "y", "no-attach", "detach", "d", "no-local", "github", "all", "json", "files", "stat", "keep", "force", "help", "h", "version", "v"]);
-const VALUE_FLAGS = new Set(["prompt", "name", "agent", "message", "size", "project", "region", "notify", "idle-minutes", "repo", "check", "run", "group", "lines", "every", "to", "pr"]);
+// ---------- untrusted archives ----------
+// A .tar.gz made in a sandbox is attacker-controlled. Instead of handing it to tar, lzs reads it
+// itself and writes regular files and directories only: no symlinks, hardlinks or devices, no
+// absolute paths or "..", nothing under a .git directory, no execute bits.
+function gunzip(file) {
+  try { return zlib.gunzipSync(fs.readFileSync(file), { maxOutputLength: 1536 << 20 }); } catch (e) { die(`could not read ${path.basename(file)}: ${e.message}`); }
+}
+function* tarEntries(buf) {
+  let off = 0, longName = null, paxPath = null;
+  while (off + 512 <= buf.length) {
+    const h = buf.subarray(off, off + 512);
+    if (h.every((b) => b === 0)) break;
+    const str = (a, b) => { const s = h.subarray(a, b); const z = s.indexOf(0); return s.subarray(0, z < 0 ? s.length : z).toString("utf8"); };
+    let size = 0;
+    if (h[124] & 0x80) { for (let i = 125; i < 136; i++) size = size * 256 + h[i]; } else size = parseInt(str(124, 136).trim() || "0", 8) || 0;
+    const type = h[156] ? String.fromCharCode(h[156]) : "0";
+    let name = str(0, 100);
+    // POSIX ustar ("ustar\0") has a name prefix at 345; GNU tar ("ustar  ") keeps other things there.
+    const prefix = str(257, 262) === "ustar" && h[262] === 0 ? str(345, 500) : "";
+    if (prefix) name = `${prefix}/${name}`;
+    const data = buf.subarray(off + 512, off + 512 + size);
+    off += 512 + Math.ceil(size / 512) * 512;
+    if (type === "L") { longName = data.toString("utf8").replace(/\0[\s\S]*$/, ""); continue; }
+    if (type === "x") { const m = data.toString("utf8").match(/(?:^|\n)\d+ path=([^\n]*)\n/); paxPath = m ? m[1] : null; continue; }
+    if (type === "g" || type === "K") continue;
+    if (longName != null) { name = longName; longName = null; }
+    if (paxPath != null) { name = paxPath; paxPath = null; }
+    yield { name, type, data };
+  }
+}
+// A path from an archive, as a safe relative path, or null.
+function safeRel(name) {
+  const parts = String(name).replace(/^(\.\/)+/, "").split("/").filter((p) => p && p !== ".");
+  if (!parts.length || String(name).startsWith("/")) return null;
+  if (parts.some((p) => p === ".." || p === ".git" || /[\x00-\x1f\x7f\\]/.test(p))) return null;
+  return parts.join("/");
+}
+function extractUntrusted(buf, dest) {
+  const stats = { files: 0, dirs: 0, skipped: 0, envrc: [] };
+  for (const e of tarEntries(buf)) {
+    const rel = safeRel(e.name);
+    if (!rel || !["0", "5"].includes(e.type)) { stats.skipped++; continue; }
+    const out = path.join(dest, rel);
+    if (!out.startsWith(dest + path.sep)) { stats.skipped++; continue; }
+    if (e.type === "5") { fs.mkdirSync(out, { recursive: true, mode: 0o755 }); stats.dirs++; continue; }
+    fs.mkdirSync(path.dirname(out), { recursive: true, mode: 0o755 });
+    try { if (!fs.lstatSync(out).isFile()) { stats.skipped++; continue; } } catch {}
+    fs.writeFileSync(out, e.data, { mode: 0o644 });
+    stats.files++;
+    if (/(^|\/)\.envrc$/.test(rel)) stats.envrc.push(rel);
+  }
+  return stats;
+}
+
+const BOOL_FLAGS = new Set(["yes", "y", "no-attach", "detach", "d", "no-local", "github", "no-github", "all", "json", "files", "stat", "keep", "force", "help", "h", "version", "v", "include-secrets", "include-mcp-secrets", "no-sync", "new-project", "no-idle-pause"]);
+const VALUE_FLAGS = new Set(["prompt", "name", "agent", "agents", "message", "size", "project", "workspace", "region", "notify", "idle-minutes", "max-hours", "repo", "check", "run", "group", "lines", "every", "to", "pr", "github-token", "pack"]);
 const USAGE = `usage: lzs [. | DIR | --repo owner/name] [-p "task"] [-d]
        lzs fan N [. | DIR | --repo owner/name] -p "task" [--check CMD]
        lzs ls | watch | peek <name> | diff | pick <name> | pull <name> | stop | rm | uninstall
@@ -177,37 +417,16 @@ function parse(argv) {
   }
   if (flags.d || flags.detach) flags["no-attach"] = true;
   if (flags.y) flags.yes = true;
-  return { flags, rest, pass };
-}
-
-const config = () => readJson(CFG_FILE, null);
-const needConfig = () => config() ?? die("no base snapshot yet. Run: lzs init");
-const sessions = () => readJson(STATE_FILE, {});
-const byAge = (s) => Object.entries(s).sort((a, b) => Date.parse(a[1].createdAt) - Date.parse(b[1].createdAt));
-// lzs-2 before lzs-10, whatever order a fan-out happened to start them in.
-const byName = (s) => Object.entries(s).sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }));
-
-// Remember (or forget) what lzs made on Lizard, as soon as it exists.
-function recordCreated(kind, id, add = true) {
-  if (!id) return;
-  const c = readJson(CREATED_FILE, {});
-  const list = new Set(c[kind] ?? []);
-  add ? list.add(id) : list.delete(id);
-  c[kind] = [...list];
-  writeJson(CREATED_FILE, c);
-}
-
-// Read-modify-write under a lock directory: `lzs fan` / `lzs group` start several at once.
-function updateSessions(fn) {
-  const lock = STATE_FILE + ".lock";
-  fs.mkdirSync(CFG_DIR, { recursive: true });
-  for (let i = 0; ; i++) {
-    try { fs.mkdirSync(lock); break; } catch {
-      if (i > 200) { fs.rmSync(lock, { recursive: true, force: true }); continue; } // stale (~10 s)
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
-    }
+  if (flags.name !== undefined && !NAME_RE.test(flags.name)) die(`--name must be 1-40 characters of A-Z a-z 0-9 . _ -`);
+  if (flags.agent !== undefined && !AGENTS[flags.agent]) die(`unknown agent '${flags.agent}' (claude, codex, opencode)`);
+  if (flags.repo !== undefined) {
+    flags.repo = String(flags.repo).replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "").replace(/\/$/, "");
+    if (!SLUG_RE.test(flags.repo)) die(`--repo wants owner/name (a GitHub repository)`);
   }
-  try { const s = sessions(); fn(s); writeJson(STATE_FILE, s); } finally { fs.rmSync(lock, { recursive: true, force: true }); }
+  for (const k of ["idle-minutes", "max-hours"]) if (flags[k] !== undefined && !/^\d+(\.\d+)?$/.test(flags[k])) die(`--${k} wants a number`);
+  if (flags["idle-minutes"] !== undefined && Number(flags["idle-minutes"]) === 0 && !flags["no-idle-pause"]) die("--idle-minutes 0 would keep sessions running (and billing) forever when idle; if that is what you want, say --no-idle-pause");
+  if (flags["no-idle-pause"]) flags["idle-minutes"] = "0";
+  return { flags, rest, pass };
 }
 
 function nextNames(count) {
@@ -224,29 +443,59 @@ function findSession(ref, { announce = false } = {}) {
   }
   if (s[ref]) return [ref, s[ref]];
   if (/^\d+$/.test(ref) && s[`lzs-${ref}`]) return [`lzs-${ref}`, s[`lzs-${ref}`]];
-  return Object.entries(s).find(([, v]) => v.id === ref) ?? die(`no session '${ref}'. See: lzs ls`);
+  return Object.entries(s).find(([, v]) => v.id === ref) ?? die(`no session '${safeText(ref)}'. See: lzs ls`);
 }
 
-function liveSandboxes(cfg) {
+// The project's sandboxes by id. Also the local half of --max-hours: a session that has been
+// running far longer than its limit (its watchdog was killed, or could not pause it) is paused here.
+function liveSandboxes(cfg, { skip = [] } = {}) {
   const list = lizard(["sandbox", "ls", "-p", cfg.projectId], { json: true });
   const arr = Array.isArray(list) ? list : list.sandboxes ?? [];
-  return new Map(arr.map((x) => [x.id, x]));
+  const live = new Map(arr.map((x) => [x.id, x]));
+  const now = Date.now();
+  for (const [name, v] of Object.entries(sessions())) {
+    const l = live.get(v.id);
+    const h = Number(v.maxHours ?? cfg.maxHours ?? 24);
+    if (!l || l.status !== "running" || !h || skip.includes(name)) continue;
+    const since = Date.parse(v.wokeAt ?? v.createdAt);
+    if (now - since > (h * 3600 + 1800) * 1000) {
+      const r = lizard(["sandbox", "pause", v.id, "--no-wait"], { check: false });
+      if (r.status === 0) { l.status = "pausing"; say(`${bold(name)} has run for more than ${h} h (--max-hours): paused. lzs resume ${name} continues it`); }
+    }
+  }
+  return live;
 }
 
 function notify(title, text) {
   process.stderr.write("\x07");
+  title = oneLine(title).slice(0, 200); text = safeText(text).slice(0, 1000);
   if (process.platform === "darwin") spawn("osascript", ["-e", `display notification ${JSON.stringify(text)} with title ${JSON.stringify(title)}`], { stdio: "ignore", detached: true }).on("error", () => {}).unref();
-  else if (process.platform === "linux") spawn("notify-send", [title, text], { stdio: "ignore", detached: true }).on("error", () => {}).unref();
+  else if (process.platform === "linux") spawn("notify-send", ["--", title, text], { stdio: "ignore", detached: true }).on("error", () => {}).unref();
+}
+
+// Where a notification URL goes, by its host name (not by what it contains).
+function notifyKind(url) {
+  let u;
+  try { u = new URL(url); } catch { die(`--notify: '${safeText(url)}' is not a URL`); }
+  if (u.protocol !== "https:") die("--notify needs an https URL");
+  const h = u.hostname.toLowerCase();
+  if (h === "hooks.slack.com") return "slack";
+  if ((h === "discord.com" || h === "discordapp.com") && u.pathname.startsWith("/api/webhooks/")) return "discord";
+  if (h === "api.telegram.org") return "telegram";
+  return "ntfy";
 }
 
 // ---------- what lives inside the sandbox ----------
 // start.sh <agent> <new|continue|prompt> [b64 prompt]: start the agent in tmux (in the session's
-// working directory) and the idle watchdog. A running agent is left alone.
+// working directory) and the watchdog. A running agent is left alone. Only the agent's login
+// (agent.env) goes into its environment; watchdog.env (the notification URL) is never exported.
 const START_SH = String.raw`#!/bin/bash
 set -u
 L=/root/.lzs
-agent="$1"; mode="$2"; prompt="$(echo "\${3:-}" | base64 -d 2>/dev/null)"
-[ -f $L/env ] && set -a && . $L/env && set +a
+agent="$1"; mode="$2"; prompt="$(printf '%s' "\${3:-}" | base64 -d 2>/dev/null)"
+case "$agent" in claude|codex|opencode) ;; *) echo "unknown agent" >&2; exit 2 ;; esac
+case "$mode" in new|continue|prompt) ;; *) echo "unknown mode" >&2; exit 2 ;; esac
+[ -f $L/agent.env ] && set -a && . $L/agent.env && set +a
 cmd="$(cat $L/agents/$agent.$mode)"
 [ "$mode" = prompt ] && cmd="$cmd $(printf %q "$prompt")"
 cwd="$(cat $L/cwd 2>/dev/null || echo /workspace)"; mkdir -p "$cwd"
@@ -256,29 +505,47 @@ if ! tmux has-session -t agent 2>/dev/null; then
   tmux set -g status-style 'bg=#0f2a1a,fg=#9be7b4'; tmux set -g status-right " lzs · $(cat $L/name 2>/dev/null) · Ctrl-b d to detach "; tmux set -g status-right-length 80
 fi
 pkill -f "$L/watchdog.sh" 2>/dev/null
-setsid nohup $L/watchdog.sh >$L/watchdog.log 2>&1 </dev/null &
+setsid nohup env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u OPENAI_API_KEY -u OPENROUTER_API_KEY -u DEEPSEEK_API_KEY -u MOONSHOT_API_KEY $L/watchdog.sh >>$L/watchdog.log 2>&1 </dev/null &
 `.replace(/\\\$\{/g, "${");
 
 // The sandbox's own supervisor, so all of this works with your laptop closed:
 // - when the agent finishes a turn (its "esc to interrupt" goes away), run the session's check
-//   (your tests, say) and notify you (LZS_NOTIFY: ntfy, Slack, Discord or Telegram URL);
-// - once nothing has happened for LZS_IDLE_MINUTES (no change on the agent's screen, no keystroke
-//   from anyone attached), pause the sandbox. Pausing keeps the files; compute billing stops.
+//   (your tests, say) and notify you;
+// - once nothing has happened for the idle minutes (no change on the agent's screen, no keystroke
+//   from anyone attached), or the sandbox has been up for max hours, pause it. Pausing keeps the
+//   files; compute billing stops. It pauses with the sandbox's own key (lizard sandbox create
+//   --with-token), which Lizard deletes with the sandbox.
 const WATCHDOG_SH = String.raw`#!/bin/bash
 L=/root/.lzs
-[ -f $L/env ] && set -a && . $L/env && set +a
-idle_min="\${LZS_IDLE_MINUTES:-30}"
-last=$(date +%s); prev=""; was=""; worked=0; tick=0; checked=""
+# Read, not exported: the check (your tests, i.e. code from the repository) does not see these.
+LZS_NOTIFY=; LZS_NOTIFY_KIND=; LZS_IDLE_MINUTES=30; LZS_MAX_HOURS=24
+[ -f $L/watchdog.env ] && . $L/watchdog.env
+idle_min=$(cat $L/idle_minutes 2>/dev/null || echo "$LZS_IDLE_MINUTES")
+max_h=$(cat $L/max_hours 2>/dev/null || echo "$LZS_MAX_HOURS")
+case "$idle_min" in ''|*[!0-9]*) idle_min=30 ;; esac
+case "$max_h" in ''|*[!0-9.]*) max_h=24 ;; esac
+max_s=$(awk -v h="$max_h" 'BEGIN { printf "%d", h * 3600 }')
+last=$(date +%s); prev=""; was=""; worked=0; tick=0; checked=""; tried=0
 
-notify() { # $1 title, $2 text
-  local u="\${LZS_NOTIFY:-}"; [ -z "$u" ] && return 0
-  case "$u" in
-    *hooks.slack.com*) curl -fsS -m 10 -H 'Content-Type: application/json' -d "$(node -e 'console.log(JSON.stringify({text:process.argv[1]+"\n"+process.argv[2]}))' "$1" "$2")" "$u" ;;
-    *discord.com/api/webhooks*) curl -fsS -m 10 -H 'Content-Type: application/json' -d "$(node -e 'console.log(JSON.stringify({content:"**"+process.argv[1]+"**\n"+process.argv[2]}))' "$1" "$2")" "$u" ;;
-    *api.telegram.org*) curl -fsS -m 10 --data-urlencode "text=$1
-$2" "$u" ;;
-    *) curl -fsS -m 10 -H "Title: $1" -H "Tags: lizard" -d "$2" "$u" ;;
+clean() { tr -d '\000-\010\013-\037\177'; }
+notify() { # $1 title, $2 text: the session name, its state, the check result and the agent's title
+  [ -z "$LZS_NOTIFY" ] && return 0
+  local t b
+  t=$(printf '%s' "$1" | tr -d '\000-\037\177' | head -c 200); b=$(printf '%s' "$2" | clean | head -c 300)
+  case "$LZS_NOTIFY_KIND" in
+    slack) curl -fsS -m 10 -H 'Content-Type: application/json' -d "$(T="$t" B="$b" node -e 'console.log(JSON.stringify({text:process.env.T+"\n"+process.env.B}))')" "$LZS_NOTIFY" ;;
+    discord) curl -fsS -m 10 -H 'Content-Type: application/json' -d "$(T="$t" B="$b" node -e 'console.log(JSON.stringify({content:"**"+process.env.T+"**\n"+process.env.B}))')" "$LZS_NOTIFY" ;;
+    telegram) curl -fsS -m 10 --data-urlencode "text=$t
+$b" "$LZS_NOTIFY" ;;
+    *) curl -fsS -m 10 -H "Title: $t" -H "Tags: lizard" -d "$b" "$LZS_NOTIFY" ;;
   esac >/dev/null 2>&1
+}
+
+pause_self() { # $1 why
+  echo "$(date -u +%FT%TZ) $1: pausing"
+  sync
+  lizard sandbox pause "$(cat $L/id)" --no-wait && exit 0
+  echo "$(date -u +%FT%TZ) could not pause (no sandbox key?)"
 }
 
 run_check() { # writes check.rc / check.log / check.at; returns the exit code
@@ -292,6 +559,13 @@ tree() { ( cd "$(cat $L/cwd 2>/dev/null || echo /workspace)" && { git rev-parse 
 
 while sleep 2; do
   now=$(date +%s); tick=$((tick + 1))
+  # The hard limit: time since this boot (a pause ends every process; a resume boots fresh).
+  up=$(cut -d. -f1 /proc/uptime)
+  if [ "$max_s" -gt 0 ] && [ "$up" -ge "$max_s" ] && [ $((now - tried)) -ge 300 ]; then
+    tried=$now
+    notify "$(cat $L/name) ran for $max_h h: pausing" "lzs resume $(cat $L/name) continues it"
+    pause_self "up $max_h h (max)"
+  fi
   screen=$(tmux capture-pane -p -t agent 2>/dev/null)
   cur=$(printf '%s' "$screen" | md5sum)
   [ "$cur" != "$prev" ] && last=$now && prev="$cur"
@@ -312,7 +586,7 @@ while sleep 2; do
       if run_check; then msg="$msg - check passed"; else msg="$msg - check FAILED"; fi
       last=$(date +%s)
     fi
-    notify "$msg" "\${title:-$(cat $L/prompt 2>/dev/null | head -c 200)}"
+    notify "$msg" "\${title:-}"
     worked=0
   fi
   # The code changed since the last check while nobody is working (a turn too short to see,
@@ -323,9 +597,7 @@ while sleep 2; do
   was=$state
 
   if [ "$idle_min" != 0 ] && [ $((now - last)) -ge $((idle_min * 60)) ]; then
-    echo "$(date -u +%FT%TZ) idle \${idle_min}m: pausing"
-    sync
-    LIZARD_API_KEY="$(cat $L/key)" lizard sandbox pause "$(cat $L/id)" --no-wait && exit 0
+    pause_self "idle \${idle_min}m"
     last=$now
   fi
 done
@@ -336,7 +608,7 @@ done
 const PROBE_SH = String.raw`
 L=/root/.lzs
 tmux has-session -t agent 2>/dev/null || { echo "NOAGENT"; exit 0; }
-echo "TITLE $(tmux display -p -t agent '#{pane_title}')"
+echo "TITLE $(tmux display -p -t agent '#{pane_title}' | tr -d '\n')"
 echo "LAST $(cat $L/last_activity 2>/dev/null || echo 0) $(date +%s)"
 cwd=$(cat $L/cwd 2>/dev/null)
 if [ -n "$cwd" ] && [ -d "$cwd/.git" ] && [ -f $L/base ]; then
@@ -351,6 +623,14 @@ fi
 [ -f $L/worked ] && echo "WORKED 1"
 echo "SCREEN"
 tmux capture-pane -p -t agent | sed -e 's/[[:space:]]*$//' | grep -v '^$' | tail -25
+`;
+
+// Agent conversations, for bringing back to your machine: transcript files only.
+const TX_SH = String.raw`
+cd /root || exit 0
+find .claude/projects .codex/sessions -type f \( -name '*.jsonl' -o -name '*.json' \) -size -100M -print0 2>/dev/null > /tmp/lzs-tx.list
+[ -s /tmp/lzs-tx.list ] || { echo NONE; exit 0; }
+tar -czf /tmp/lzs-tx.tgz --null --no-recursion -T /tmp/lzs-tx.list && rm -f /tmp/lzs-tx.list && echo PACKED
 `;
 
 // An interactive login shell lands straight in the agent's tmux session (lzs resume, or the
@@ -374,19 +654,18 @@ function classify(screen) {
 function parseProbe(out) {
   if (!out || /NOAGENT/.test(out)) return { state: "no agent" };
   const get = (k) => (out.match(new RegExp(`^${k} (.*)$`, "m")) ?? [])[1];
-  const screen = out.split(/^SCREEN$/m)[1] ?? "";
+  const screen = safeText(out.split(/^SCREEN$/m)[1] ?? "");
   const [last, now] = (get("LAST") ?? "0 0").split(" ").map(Number);
   const g = get("GIT")?.split(" ").map((x) => Number(x) || 0);
   const git = g ? { commits: g[0], added: g[1], removed: g[2], untracked: g[3], files: g[4] } : null;
   const ck = get("CHECK")?.split(" ");
   const check = ck ? { state: ck[0] === "running" ? "running" : ck[0] === "0" ? "passed" : "failed", rc: ck[0], at: Number(ck[1]) || 0 } : null;
-  let title = (get("TITLE") ?? "").replace(/^[^\p{L}\p{N}]+/u, "").trim();
+  let title = oneLine(get("TITLE") ?? "").replace(/^[^\p{L}\p{N}]+/u, "").trim();
   if (!title || /^(e2b(\.local)?|localhost|bash|claude( code)?|codex|opencode)$/i.test(title)) {
-    // No title from the agent: the last thing it said.
     const said = screen.split("\n").filter((l) => /^\s*(⏺|•|●)\s+\S/.test(l)).at(-1);
     title = said ? said.replace(/^\s*(⏺|•|●)\s+/, "") : "";
   }
-  return { state: classify(screen), worked: /^WORKED 1$/m.test(out), title, idleS: last && now ? now - last : null, git, check, screen };
+  return { state: classify(screen), worked: /^WORKED 1$/m.test(out), title: oneLine(title).slice(0, 300), idleS: last && now ? now - last : null, git, check, screen };
 }
 
 async function probeAll(entries, live) {
@@ -395,9 +674,7 @@ async function probeAll(entries, live) {
     if (status !== "running") return { name, v, status, state: status };
     const r = await remoteAsync(v.id, PROBE_SH, { timeoutMs: 15000 });
     const p = r.status === 0 ? parseProbe(r.stdout) : { state: "unreachable" };
-    // Given a task but not at it yet: the agent is still starting up.
     if (v.prompt && p.state === "waiting" && !p.worked && Date.now() - Date.parse(v.createdAt) < 120000) p.state = "starting";
-    // Nothing on the screen yet (just created or woken): still starting, not your turn.
     if (p.state === "waiting" && !(p.screen ?? "").trim()) p.state = "starting";
     return { name, v, status, ...p };
   });
@@ -406,7 +683,6 @@ async function probeAll(entries, live) {
 const STATE_COLOR = { starting: dim, working: cyan, waiting: green, asking: magenta, exited: yellow, paused: dim, pausing: dim, resuming: dim, gone: red, unreachable: red, "no agent": yellow };
 const STATE_LABEL = { waiting: "your turn", asking: "asking you" };
 
-// "+120 −30 · 2 new · 3 commits": what the session changed against where it started.
 function diffBits(g) {
   if (!g) return "";
   const bits = [];
@@ -420,10 +696,9 @@ function renderTable(rows, cfg) {
   const w = process.stdout.columns || 120;
   const lines = rows.map((r) => {
     const st = (STATE_COLOR[r.state] ?? ((x) => x))((STATE_LABEL[r.state] ?? r.state).padEnd(11));
-    const gitBits = diffBits(r.git);
     const check = r.check ? (r.check.state === "passed" ? green("✓ check") : r.check.state === "running" ? cyan("… check") : red("✗ check")) : "";
     const idle = r.status === "running" && r.idleS != null && r.state !== "working" && r.idleS >= 60 ? `idle ${Math.round(r.idleS / 60)}m` : "";
-    const text = [r.v.repo?.name, r.title ? trunc(r.title, 60) : r.v.prompt ? trunc(r.v.prompt, 60) : "", gitBits, idle].filter(Boolean);
+    const text = [r.v.repo?.name, r.title ? trunc(r.title, 60) : r.v.prompt ? trunc(oneLine(r.v.prompt), 60) : "", diffBits(r.git), idle].filter(Boolean);
     const room = Math.max(20, w - 31 - (check ? 9 : 0));
     return `${bold(r.name.padEnd(9))} ${st} ${dim(r.v.agent.padEnd(8))} ${check ? check + " " : ""}${trunc(text.join(" · "), room)}`;
   });
@@ -434,78 +709,133 @@ function renderTable(rows, cfg) {
 }
 
 // ---------- init ----------
+async function ask(rl, question) { return rl ? (await rl.question(question)).trim() : ""; }
+
+async function resolveProject(flags, rl) {
+  const list = lizard(["project", "list"], { json: true });
+  const projects = Array.isArray(list) ? list : list?.projects ?? [];
+  if (flags["new-project"]) {
+    const me = lizard(["whoami"], { json: true });
+    const name = `lzs-${String(me.username || me.id).toLowerCase().replace(/[^a-z0-9-]/g, "-")}`.slice(0, 40);
+    const have = projects.find((p) => p.name === name);
+    if (have) {
+      if (!(created().projects ?? []).includes(have.id)) die(`a project named ${name} exists, and this lzs did not make it. Use it with --project ${name} if it is yours alone`);
+      say(`using project ${bold(name)} (made by lzs init --new-project)`);
+      return have;
+    }
+    const p = lizard(["project", "create", name, ...(flags.workspace ? ["-w", flags.workspace] : [])], { json: true });
+    const id = p.id ?? p.project?.id ?? die(`lizard project create answered without an id`);
+    recordCreated("projects", id);
+    say(`created project ${bold(name)} (${id}) for lzs only`);
+    return { ...p, id, name };
+  }
+  const want = flags.project;
+  const p = projects.find((x) => x.id === want || x.name === want || x.slug === want);
+  return p ?? die(`no project '${safeText(want)}' (lizard project list shows yours; lzs init --new-project makes one for lzs)`);
+}
+
+// Who else can restore this project's snapshots and open its sandboxes (project and workspace members).
+async function otherMembers(project) {
+  const me = lizard(["whoami"], { json: true, check: false });
+  const [pm, wm] = await Promise.all([apiGet(`/api/projects/${encodeURIComponent(project.id)}/members`), project.workspaceId ? apiGet(`/api/workspaces/${encodeURIComponent(project.workspaceId)}/members`) : null]);
+  if (!Array.isArray(pm) && !Array.isArray(wm)) return null;
+  const others = new Map();
+  for (const m of [...(Array.isArray(pm) ? pm : []), ...(Array.isArray(wm) ? wm : [])]) if (m.userId && m.userId !== me?.id) others.set(m.userId, oneLine(m.username ?? m.userId));
+  return [...others.values()];
+}
+
+// Which Lizard-connected logins this project has (Agents page / `lizard agents login`).
+function connectedKinds(project) {
+  const r = lizard(["agents", "status", "--project", project], { json: true, check: false });
+  return (r?.credentials ?? []).filter((c) => c.connected).map((c) => c.kind);
+}
+
 async function cmdInit(flags) {
   const agent = flags.agent || "claude";
-  if (!AGENTS[agent]) die(`unknown agent '${agent}' (claude, codex, opencode)`);
   const size = flags.size || "nano";
+  if (!RATE[size]) die(`unknown size '${safeText(size)}' (${Object.keys(RATE).join(", ")})`);
+  if (!flags.project && !flags["new-project"]) {
+    die(`lzs init needs the project its sandboxes live in:
+  lzs init --new-project        a project for lzs alone (lzs-<you>), recommended
+  lzs init --project <name>     an existing one
+Everything inside a session (the agent, code from the repo) can act on that project with the
+session's key: list and open its other sandboxes, restore its snapshots. Keep it to lzs.`);
+  }
+  const wanted = (flags.agents ?? "claude,codex,opencode").split(",").map((s) => s.trim()).filter(Boolean);
+  for (const a of wanted) if (!AGENTS[a]) die(`--agents: unknown agent '${safeText(a)}'`);
+  if (!wanted.includes(agent)) wanted.unshift(agent);
+  const idleMinutes = Number(flags["idle-minutes"] ?? 30);
+  const maxHours = Number(flags["max-hours"] ?? 24);
+  const notifyUrl = flags.notify ?? null;
+  const kind = notifyUrl ? notifyKind(notifyUrl) : null;
+  if (flags.github) say("--github no longer copies your gh login anywhere: a --repo session gets a GitHub grant for that one repository from Lizard, and lzs push on a local repo pushes from this machine");
   const old = config();
-  const rl = process.stdin.isTTY && !flags.yes ? readline.createInterface({ input: process.stdin, output: process.stderr }) : null;
+  const rl = interactive() && !flags.yes ? readline.createInterface({ input: process.stdin, output: process.stderr }) : null;
+  cleanups.push(() => rl?.close());
 
-  // The agent's login: a long-lived token in the base, so every session starts signed in.
+  const project = await resolveProject(flags, rl);
+  const others = await otherMembers(project);
+  if (others === null) say(`could not check who else can open project ${project.name}`);
+  else if (others.length) {
+    warnLoud(`${plural(others.length, "other person", "other people")} can open project ${bold(project.name)} (${others.slice(0, 8).join(", ")}${others.length > 8 ? ", …" : ""}). They can restore your base snapshot, which holds your agent login, and open your sessions. lzs init --new-project makes a project of your own.`);
+    if (rl && !/^y/i.test(await ask(rl, "build the base there anyway? [y/N] "))) die("nothing created");
+  }
+
+  // Logins: every agent's from the environment, or what is connected on Lizard. Decided before
+  // anything is created, so a missing login leaves nothing behind.
   const tokens = {};
-  for (const k of AGENTS[agent].env) if (process.env[k]) tokens[k] = process.env[k];
-  // Or the login connected on Lizard for this project: nothing to paste.
-  const connected = !Object.keys(tokens).length && agentConnectedOnLizard(agent, flags.project);
-  if (connected) say(`using the ${agent} login connected on Lizard (${connected})`);
-  if (!Object.keys(tokens).length && !connected && rl) {
-    console.error(`\n${bold(`${agent} login`)}: ${AGENTS[agent].hint}.`);
-    const v = (await rl.question(`${AGENTS[agent].env[0]} (empty to sign in by hand): `)).trim();
-    if (v) tokens[v.startsWith("sk-ant-api") ? "ANTHROPIC_API_KEY" : AGENTS[agent].env[0]] = v;
+  for (const a of wanted) for (const k of AGENTS[a].env) if (process.env[k]) tokens[k] = process.env[k];
+  const kinds = connectedKinds(project.id);
+  const covered = (a) => AGENTS[a].env.some((k) => tokens[k]) || AGENTS[a].kinds.some((k) => kinds.includes(k));
+  if (!covered(agent) && !rl) die(`no ${agent} login: ${AGENTS[agent].hint}. Nothing was created.`);
+  if (!covered(agent) && agent === "claude") {
+    console.error(`\n${bold("claude login")}: ${AGENTS.claude.hint}.`);
+    const v = await ask(rl, "CLAUDE_CODE_OAUTH_TOKEN (empty to sign in by hand in the base): ");
+    if (v) tokens[v.startsWith("sk-ant-api") ? "ANTHROPIC_API_KEY" : "CLAUDE_CODE_OAUTH_TOKEN"] = v;
   }
+  const useLizard = kinds.some((k) => wanted.some((a) => AGENTS[a].kinds.includes(k)));
+  if (useLizard) say(`using the logins connected on Lizard for ${project.name}: ${kinds.join(", ")}`);
 
-  // GitHub, so sessions can clone private repos and push branches (lzs push). Opt in.
-  let ghToken = process.env.LZS_GH_TOKEN || "";
-  const localGh = () => spawnSync("gh", ["auth", "token"], { encoding: "utf8" }).stdout?.trim() || "";
-  if (!ghToken && flags.github) ghToken = localGh() || die("--github: `gh auth token` gave nothing. Run `gh auth login` first.");
-  else if (!ghToken && rl && localGh()) {
-    const a = (await rl.question(`Let sessions use your GitHub login (clone private repos, push branches)? [y/N] `)).trim();
-    if (/^y/i.test(a)) ghToken = localGh();
-  }
-  rl?.close();
   const gitCfg = (k) => spawnSync("git", ["config", "--global", k], { encoding: "utf8" }).stdout?.trim();
   const gitName = gitCfg("user.name"), gitEmail = gitCfg("user.email");
 
   const t0 = Date.now();
-  say(`creating the base sandbox (${size})…`);
-  const create = ["sandbox", "create", "-t", "claude", "-s", size, "--timeout", "2h"];
-  if (flags.project) create.push("-p", flags.project);
-  if (flags.region) create.push("--region", flags.region);
-  const sb = lizard(create, { json: true });
-  const id = sb.id;
+  say(`creating the base sandbox (${size}) in ${bold(project.name)}…`);
+  // No --with-token: the base (and so every snapshot of it) carries no Lizard key at all.
+  const made = lizardTry(["sandbox", "create", "-t", "claude", "-s", size, "--timeout", "2h", "-p", project.id, ...(flags.region ? ["--region", flags.region] : [])]);
+  if (!made.ok) { const rf = refusal(made.error, "the base sandbox"); die(rf.text, rf.limit ? EXIT_LIMIT : 1); }
+  const id = made.data.id;
   recordCreated("sandboxes", id);
-  const projectName = sb.projectName ?? projectNameOf(sb.projectId);
-  say(`base sandbox ${id} in project ${projectName ? `${bold(projectName)} (${sb.projectId})` : sb.projectId}`);
+  let baseDone = false;
+  cleanups.push(() => {
+    if (baseDone) return;
+    console.error(dim(`lzs deleting the unfinished base sandbox ${id}`));
+    if (spawnSync("lizard", ["sandbox", "rm", id, "--yes"], { stdio: "ignore" }).status === 0) { try { recordCreated("sandboxes", id, false); } catch {} }
+  });
+  say(`base sandbox ${id}`);
 
-  // One key scoped to the project, kept in the base, lets each sandbox pause itself when idle.
-  const key = lizard(["keys", "create", `lzs-${projectName ?? sb.projectId}`.slice(0, 60), "-p", sb.projectId], { json: true });
-  recordCreated("keys", key.id);
-
-  say("installing tmux and the agent…");
+  say(`installing tmux and the agents (${wanted.join(", ")})…`);
   const agentFiles = Object.entries(AGENTS).map(([n, a]) =>
-    `printf '%s' ${q(a.start)} > $L/agents/${n}.new; printf '%s' ${q(a.prompt)} > $L/agents/${n}.prompt; printf '%s' ${q(a.cont)} > $L/agents/${n}.continue`).join("\n");
-  const idleMinutes = Number(flags["idle-minutes"] ?? 30);
-  // DISABLE_AUTOUPDATER: no "Update installed · Restart to apply" on the agent's screen.
-  const env = { IS_SANDBOX: "1", DISABLE_AUTOUPDATER: "1", LZS_IDLE_MINUTES: String(idleMinutes), ...tokens };
-  if (flags.notify) env.LZS_NOTIFY = flags.notify;
-  if (ghToken) env.GH_TOKEN = ghToken;
+    `printf %s ${b64(a.start)} | base64 -d > $L/agents/${n}.new; printf %s ${b64(a.prompt)} | base64 -d > $L/agents/${n}.prompt; printf %s ${b64(a.cont)} | base64 -d > $L/agents/${n}.continue`).join("\n");
+  const pkgs = wanted.map((a) => `command -v ${a} >/dev/null || need="$need ${AGENTS[a].pkg}"`).join("\n");
   remote(id, `set -e
-L=${REMOTE}; mkdir -p $L/agents /workspace
-command -v tmux >/dev/null || { apt-get update -qq >/dev/null; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tmux >/dev/null; }
-${AGENTS[agent].install}
-echo ${b64(START_SH)} | base64 -d > $L/start.sh
-echo ${b64(WATCHDOG_SH)} | base64 -d > $L/watchdog.sh
-chmod +x $L/*.sh
+L=${REMOTE}; mkdir -p $L/agents /workspace; chmod 700 $L
+need=""
+${pkgs}
+( [ -z "$need" ] || npm i -g $need >/tmp/lzs-npm.log 2>&1 || echo "npm install of$need failed: $(tail -3 /tmp/lzs-npm.log)" ) &
+( command -v tmux >/dev/null || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tmux; } >/tmp/lzs-apt.log 2>&1 ) &
+wait
+command -v tmux >/dev/null || { echo "tmux did not install: $(tail -3 /tmp/lzs-apt.log)"; exit 1; }
+printf %s ${b64(START_SH)} | base64 -d > $L/start.sh
+printf %s ${b64(WATCHDOG_SH)} | base64 -d > $L/watchdog.sh
+chmod 700 $L/*.sh
 ${agentFiles}
-echo ${b64(Object.entries(env).map(([k, v]) => `${k}=${q(v)}`).join("\n") + "\n")} | base64 -d > $L/env
-echo ${b64(key.key)} | base64 -d > $L/key
-chmod 600 $L/env $L/key
-grep -q 'lzs: attach' /root/.bashrc || echo ${b64(BASHRC)} | base64 -d >> /root/.bashrc
+grep -q 'lzs: attach' /root/.bashrc || printf %s ${b64(BASHRC)} | base64 -d >> /root/.bashrc
 grep -q 'focus-events' /root/.tmux.conf 2>/dev/null || echo 'set -g focus-events on' >> /root/.tmux.conf
-${gitName ? `git config --global user.name ${q(gitName)}` : ""}
-${gitEmail ? `git config --global user.email ${q(gitEmail)}` : ""}
+${gitName ? `git config --global user.name ${bv(gitName)}` : ""}
+${gitEmail ? `git config --global user.email ${bv(gitEmail)}` : ""}
 git config --global advice.detachedHead false
-printf '%s\n' __pycache__/ '*.pyc' node_modules/ .venv/ .DS_Store .pytest_cache/ > /root/.gitignore_global && git config --global core.excludesFile /root/.gitignore_global
-${ghToken ? `GH_TOKEN=${q(ghToken)} gh auth setup-git >/dev/null 2>&1 || true` : ""}
+printf '%s\\n' __pycache__/ '*.pyc' node_modules/ .venv/ .DS_Store .pytest_cache/ > /root/.gitignore_global && git config --global core.excludesFile /root/.gitignore_global
 # Claude Code: no first-run screens, /workspace trusted, bypass mode accepted.
 node -e '
 const fs=require("fs"),f="/root/.claude.json";let j={};try{j=JSON.parse(fs.readFileSync(f))}catch{}
@@ -518,91 +848,269 @@ const fs=require("fs"),f="/root/.claude/settings.json";let j={};try{j=JSON.parse
 j.skipDangerousModePermissionPrompt=true;j.env={...(j.env||{}),DISABLE_AUTOUPDATER:"1"};fs.writeFileSync(f,JSON.stringify(j,null,2))'
 `);
 
-  // Your own setup: CLAUDE.md, skills, agents, commands, and user-level MCP servers.
-  if (!flags["no-local"]) pushLocalSetup(id);
+  // The agents' logins (agent.env, in the agent's environment) and the watchdog's settings
+  // (watchdog.env, never exported). As files: secrets never go on a command line.
+  const envLines = (o) => Object.entries(o).map(([k, v]) => `${k}=${q(v)}`).join("\n") + "\n";
+  putSecretText(id, envLines({ IS_SANDBOX: "1", DISABLE_AUTOUPDATER: "1", ...tokens }), `${REMOTE}/agent.env`);
+  putSecretText(id, envLines({ LZS_IDLE_MINUTES: String(idleMinutes), LZS_MAX_HOURS: String(maxHours), ...(notifyUrl ? { LZS_NOTIFY: notifyUrl, LZS_NOTIFY_KIND: kind } : {}) }), `${REMOTE}/watchdog.env`);
 
-  if (connected) {
+  // Your own setup: CLAUDE.md, skills, settings, Codex and OpenCode config, MCP servers.
+  if (!flags["no-local"]) await pushLocalSetup(id, flags, rl);
+
+  if (useLizard) {
     // The terminal carries the Lizard-connected logins: keep the agent ones in the base.
-    const keys = "CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|OPENAI_API_KEY|OPENROUTER_API_KEY|MOONSHOT_API_KEY|DEEPSEEK_API_KEY";
-    const t = await terminalLine(id, `env | grep -E '^(${keys})=' > ${REMOTE}/agent-env.raw`);
-    const r = remote(id, `cd ${REMOTE} && n=0; while IFS='=' read -r k v; do [ -n "$k" ] && printf '%s=%q\\n' "$k" "$v" >> env && n=$((n+1)); done < agent-env.raw; rm -f agent-env.raw; echo $n`, { check: false });
-    if (!t.ok || !(Number(r.stdout.trim()) > 0)) die(`could not read the ${agent} login from Lizard; set ${AGENTS[agent].env[0]} and run lzs init again`);
-    tokens.__lizard = "1";
+    const t = await terminalLine(id, `env | grep -E '^(${LOGIN_VARS})=' > ${REMOTE}/agent-env.raw; chmod 600 ${REMOTE}/agent-env.raw`);
+    const r = remote(id, `cd ${REMOTE} && n=0; [ -f agent-env.raw ] && while IFS='=' read -r k v; do [ -n "$k" ] && printf '%s=%q\\n' "$k" "$v" >> agent.env && n=$((n+1)); done < agent-env.raw; rm -f agent-env.raw; echo $n`, { check: false });
+    if (!t.ok || !(Number(r.stdout.trim()) > 0)) say("could not read the logins connected on Lizard from the sandbox's terminal");
   }
-  if (!Object.keys(tokens).length) {
-    if (!interactive()) { lizard(["sandbox", "rm", id], { check: false }); recordCreated("sandboxes", id, false); die(`no ${agent} login: set ${AGENTS[agent].env.join(" or ")} (or connect it on Lizard: lizard agents login ${agent}) and run lzs init again`); }
-    console.error(`\n${bold("Sign in by hand now.")} You are in the base sandbox's shell. Run:\n  ${agent === "claude" ? "claude setup-token   then: echo CLAUDE_CODE_OAUTH_TOKEN=<token> >> /root/.lzs/env" : agent === "codex" ? "codex login --device-auth" : "opencode auth login"}\nthen type ${bold("exit")} to save the base.\n`);
+  // Codex wants an API key as a login of its own.
+  remote(id, `set -a; . ${REMOTE}/agent.env; set +a; [ -n "\${OPENAI_API_KEY:-}" ] && command -v codex >/dev/null && [ ! -s /root/.codex/auth.json ] && printenv OPENAI_API_KEY | codex login --with-api-key >/dev/null 2>&1; true`, { check: false });
+
+  const loginsIn = () => {
+    const r = remote(id, `set -a; . ${REMOTE}/agent.env 2>/dev/null; set +a
+${Object.entries(AGENTS).map(([n, a]) => `command -v ${n} >/dev/null && echo "INSTALLED ${n}" && { ${[...a.env.map((k) => `[ -n "\${${k}:-}" ]`), ...a.files.map((f) => `[ -s ${f} ]`)].join(" || ")}; } && echo "LOGIN ${n}"`).join("\n")}
+true`, { check: false });
+    const got = (w) => Object.keys(AGENTS).filter((n) => new RegExp(`^${w} ${n}$`, "m").test(r.stdout));
+    return { installed: got("INSTALLED"), logins: got("LOGIN") };
+  };
+  let st = loginsIn();
+  if (!st.logins.includes(agent)) {
+    if (!interactive()) die(`no ${agent} login in the base: ${AGENTS[agent].hint}`);
+    console.error(`\n${bold("Sign in by hand now.")} You are in the base sandbox's shell. Run:\n  ${agent === "claude" ? `claude setup-token   then: echo CLAUDE_CODE_OAUTH_TOKEN=<token> >> ${REMOTE}/agent.env` : agent === "codex" ? "codex login --device-auth" : "opencode auth login"}\nthen type ${bold("exit")} to save the base.\n`);
     shell(id);
+    st = loginsIn();
+    if (!st.logins.includes(agent)) die(`still no ${agent} login in the base; nothing kept`);
   }
+  for (const a of wanted) if (!st.installed.includes(a)) say(`${a} did not install in the base; ${a} sessions will not start`);
 
   say("saving the base snapshot…");
   const snap = lizard(["sandbox", "snapshot", id, "--name", "lzs-base"], { json: true });
   const snapId = snap.id ?? snap.snapshotId;
-  if (!snapId) die(`the snapshot was saved without an id (lizard answered: ${JSON.stringify(snap).slice(0, 200)})`);
+  if (!snapId) die(`the snapshot was saved without an id (lizard answered: ${oneLine(JSON.stringify(snap)).slice(0, 200)})`);
   recordCreated("snapshots", snapId);
-  if (lizard(["sandbox", "rm", id], { check: false }).status === 0) recordCreated("sandboxes", id, false);
-  if (old?.keyId && old.keyId !== key.id && old.projectId === sb.projectId) say(`older sessions still use key ${old.keyId}; delete it once they are gone: lizard keys rm ${old.keyId}`);
-  writeJson(CFG_FILE, { version: 3, agent, size, notify: !!flags.notify, login: connected ? "lizard" : "token", projectId: sb.projectId, projectName, region: sb.region, idleMinutes, snapshot: snapId, keyId: key.id, github: !!ghToken, createdAt: new Date().toISOString() });
-  console.error(`\n${green("ready")} in ${secs(t0)} s · base ${snapId} (${size}${ghToken ? ", GitHub" : ""})\n\n  ${bold("lzs")}                    a fresh session\n  ${bold("lzs .")}                  this repo in a fresh session\n  ${bold(`lzs fan 5 . -p "…"`)}     five agents on one task, then ${bold("lzs watch")}\n`);
+  baseDone = true;
+  if (lizard(["sandbox", "rm", id, "--yes"], { check: false }).status === 0) recordCreated("sandboxes", id, false);
+  writeJson(CFG_FILE, {
+    version: CFG_VERSION, agent, size, projectId: project.id, projectName: project.name, region: made.data.region,
+    idleMinutes, maxHours, notify: kind, sync: !flags["no-sync"], snapshot: snapId, installed: st.installed, logins: st.logins,
+    login: useLizard ? "lizard" : "token", createdAt: new Date().toISOString(),
+  });
+  if (old) say(`this replaces your previous base${old.snapshot && old.snapshot !== snapId ? ` (${old.snapshot})` : ""}: its agent login and keys are deleted as soon as no session uses them. Also revoke the old agent token where you made it if you are rotating it.`);
+  gcOld();
+  const missing = Object.keys(AGENTS).filter((a) => !st.logins.includes(a));
+  console.error(`\n${green("ready")} in ${secs(t0)} s · base ${snapId} (${size}) · agents with a login: ${st.logins.join(", ")}${missing.length ? dim(` (not: ${missing.join(", ")})`) : ""}\n\n  ${bold("lzs")}                    a fresh session\n  ${bold("lzs .")}                  this repo in a fresh session\n  ${bold(`lzs fan 5 . -p "…"`)}     five agents on one task, then ${bold("lzs watch")}\n\n${dim("lzs init again rotates the base (a new agent login, the old base deleted).")}\n`);
 }
 
-function projectNameOf(id) {
-  const list = lizard(["project", "list"], { json: true, check: false });
-  return (Array.isArray(list) ? list : list?.projects ?? []).find((p) => p.id === id)?.name ?? null;
+// Delete what an older base left (snapshots, the 0.4 project key), by recorded id, once no
+// session needs it.
+function gcOld() {
+  const cfg = config();
+  const s = Object.values(sessions());
+  const made = created();
+  const legacy = s.some((v) => !v.v);
+  if (legacy) return; // sessions from lzs 0.4 use the old base's key and snapshot
+  const inUse = new Set([cfg?.snapshot, ...s.map((v) => v.snapshot)].filter(Boolean));
+  for (const id of made.snapshots ?? []) {
+    if (inUse.has(id)) continue;
+    const r = lizard(["sandbox", "snapshot-rm", id, "--yes"], { check: false });
+    if (r.status === 0 || /not found/i.test(lizardError(r))) { recordCreated("snapshots", id, false); say(`deleted the old base snapshot ${id}`); }
+  }
+  for (const id of made.keys ?? []) {
+    const r = lizard(["keys", "rm", id, "--yes"], { check: false });
+    if (r.status === 0 || /not found/i.test(lizardError(r))) { recordCreated("keys", id, false); say(`deleted lzs 0.4's project key ${id}`); }
+  }
 }
 
-// Is this agent's login connected on Lizard (Agents page / `lizard agents login`)?
-function agentConnectedOnLizard(agent, project) {
-  const kinds = { claude: ["claude", "anthropic_key", "openrouter_key"], codex: ["openai_key"], opencode: ["anthropic_key", "openai_key", "openrouter_key"] }[agent] ?? [];
-  const r = lizard(["agents", "status", ...(project ? ["--project", project] : [])], { json: true, check: false });
-  const list = r?.credentials ?? [];
-  const hit = list.find((c) => kinds.includes(c.kind) && c.connected);
-  return hit ? hit.label : null;
+// ---------- your setup, copied into the base without its secrets ----------
+const SECRET_NAME = /(key|token|secret|passw|credential|auth|cookie|session|bearer|private)/i;
+const SECRET_VALUE = /^(sk-|sk_|ghp_|gho_|ghs_|github_pat_|xox[abpr]-|liz_|AKIA|AIza|glpat-|eyJ)/;
+const EXEC_SETTINGS = ["hooks", "apiKeyHelper", "statusLine", "awsAuthRefresh", "awsCredentialExport", "otelHeadersHelper", "fileSuggestion", "enabledPlugins", "extraKnownMarketplaces", "forceLoginMethod", "forceLoginOrgUUID"];
+function stripSecretsDeep(v, dropped, where) {
+  if (Array.isArray(v)) return v.map((x, i) => stripSecretsDeep(x, dropped, `${where}[${i}]`));
+  if (v && typeof v === "object") {
+    const o = {};
+    for (const [k, x] of Object.entries(v)) {
+      if (SECRET_NAME.test(k) || ["env", "headers", "environment", "http_headers", "env_http_headers"].includes(k)) { dropped.push(`${where}.${k}`); continue; }
+      o[k] = stripSecretsDeep(x, dropped, `${where}.${k}`);
+    }
+    return o;
+  }
+  if (typeof v === "string" && SECRET_VALUE.test(v)) { dropped.push(where); return ""; }
+  return v;
 }
-
-function pushLocalSetup(id) {
-  const claudeDir = path.join(HOME, ".claude");
-  const items = ["CLAUDE.md", "skills", "agents", "commands"].filter((x) => fs.existsSync(path.join(claudeDir, x)));
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "lzs-"));
-  try {
-    if (items.length) {
-      const tgz = path.join(tmp, "claude.tgz");
-      const r = spawnSync("tar", ["-czf", tgz, "-C", claudeDir, "--exclude=.git", "--exclude=node_modules", ...items], { stdio: "pipe" });
-      if (r.status === 0) {
-        lizard(["sandbox", "files", "put", id, tgz, "/tmp/lzs-claude.tgz"]);
-        remote(id, "mkdir -p /root/.claude && tar -xzf /tmp/lzs-claude.tgz -C /root/.claude && rm /tmp/lzs-claude.tgz");
-        say(`copied ~/.claude: ${items.join(", ")}`);
+// MCP servers from ~/.claude.json: env and headers (where their tokens live) only with
+// --include-mcp-secrets; secret-looking arguments and URL queries dropped either way.
+function cleanMcp(servers, keepSecrets) {
+  const out = {}, stripped = [];
+  for (const [name, s] of Object.entries(servers ?? {})) {
+    const x = { ...s };
+    if (!keepSecrets) {
+      if (x.env && Object.keys(x.env).length) { delete x.env; stripped.push(`${name}.env`); }
+      if (x.headers && Object.keys(x.headers).length) { delete x.headers; stripped.push(`${name}.headers`); }
+      if (Array.isArray(x.args)) {
+        const args = [];
+        for (let i = 0; i < x.args.length; i++) {
+          const a = String(x.args[i]);
+          if (/^--?[\w-]*(key|token|secret|password)[\w-]*=/i.test(a) || SECRET_VALUE.test(a)) { stripped.push(`${name}.args`); continue; }
+          if (/^--?[\w-]*(key|token|secret|password)[\w-]*$/i.test(a)) { stripped.push(`${name}.args`); i++; continue; }
+          args.push(a);
+        }
+        x.args = args;
       }
+      if (typeof x.url === "string" && /[?&][^=]*(key|token|secret)/i.test(x.url)) { x.url = x.url.replace(/\?.*$/, ""); stripped.push(`${name}.url`); }
     }
-    // User-level MCP servers from ~/.claude.json (only that key: the rest is your local state).
-    const local = readJson(path.join(HOME, ".claude.json"), {});
-    if (local.mcpServers && Object.keys(local.mcpServers).length) {
-      const f = path.join(tmp, "mcp.json");
-      fs.writeFileSync(f, JSON.stringify(local.mcpServers));
-      lizard(["sandbox", "files", "put", id, f, "/tmp/lzs-mcp.json"]);
-      remote(id, `node -e 'const fs=require("fs"),f="/root/.claude.json";const j=JSON.parse(fs.readFileSync(f));j.mcpServers={...(j.mcpServers||{}),...JSON.parse(fs.readFileSync("/tmp/lzs-mcp.json"))};fs.writeFileSync(f,JSON.stringify(j,null,2))' && rm /tmp/lzs-mcp.json`);
-      say(`copied MCP servers: ${Object.keys(local.mcpServers).join(", ")}`);
-    }
-  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+    out[name] = x;
+  }
+  return { servers: out, stripped: [...new Set(stripped)] };
+}
+// ~/.codex/config.toml without secrets or local commands: [*.env] / header tables, secret-looking
+// keys and `notify` (a local program) are dropped. Coarse on purpose.
+function cleanCodexToml(txt, dropped) {
+  let table = "", skip = false;
+  return txt.split("\n").filter((line) => {
+    const h = line.match(/^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*$/);
+    if (h) { table = h[1]; skip = /(^|\.)(env|http_headers|env_http_headers)$/.test(table) || SECRET_NAME.test(table.split(".").at(-1)); if (skip) dropped.push(`[${table}]`); return !skip; }
+    if (skip) return false;
+    const kv = line.match(/^\s*([A-Za-z0-9_"'.-]+)\s*=/);
+    if (kv && (SECRET_NAME.test(kv[1]) || /^"?notify"?$/.test(kv[1]) || /^"?(env|http_headers|env_http_headers)"?$/.test(kv[1]) || SECRET_VALUE.test(line.split("=").slice(1).join("=").trim().replace(/^["']/, "")))) { dropped.push(`${table ? table + "." : ""}${kv[1]}`); return false; }
+    return true;
+  }).join("\n");
+}
+
+async function pushLocalSetup(id, flags, rl) {
+  const stage = mkTmp();
+  const fromHome = []; // paths relative to HOME, copied as they are
+  const staged = []; // paths relative to stage, sanitized copies
+  const notes = [];
+  const exists = (p) => fs.existsSync(path.join(HOME, p));
+  const writeStaged = (rel, content) => { fs.mkdirSync(path.dirname(path.join(stage, rel)), { recursive: true }); fs.writeFileSync(path.join(stage, rel), content, { mode: 0o600 }); staged.push(rel); };
+
+  for (const x of ["CLAUDE.md", "skills", "agents", "commands"]) if (exists(`.claude/${x}`)) fromHome.push(`.claude/${x}`);
+  if (exists(".agents/skills")) fromHome.push(".agents/skills");
+  for (const x of ["AGENTS.md", "skills", "prompts"]) if (exists(`.codex/${x}`)) fromHome.push(`.codex/${x}`);
+  for (const x of ["AGENTS.md", "agent", "agents", "command", "commands"]) if (exists(`.config/opencode/${x}`)) fromHome.push(`.config/opencode/${x}`);
+
+  // ~/.claude/settings.json: no hooks, helper commands, plugins or secret-looking env.
+  const settings = readJsonLoose(path.join(HOME, ".claude", "settings.json"), null);
+  if (settings) {
+    const dropped = EXEC_SETTINGS.filter((k) => k in settings);
+    const s = Object.fromEntries(Object.entries(settings).filter(([k]) => !EXEC_SETTINGS.includes(k)));
+    if (s.env) for (const k of Object.keys(s.env)) if (SECRET_NAME.test(k) || SECRET_VALUE.test(String(s.env[k]))) { delete s.env[k]; dropped.push(`env.${k}`); }
+    writeStaged(".lzs-claude-settings.json", JSON.stringify(s));
+    notes.push(`~/.claude/settings.json${dropped.length ? ` (without ${dropped.join(", ")})` : ""}`);
+  }
+  // ~/.codex/config.toml
+  const toml = (() => { try { return fs.readFileSync(path.join(HOME, ".codex", "config.toml"), "utf8"); } catch { return null; } })();
+  if (toml != null) {
+    const dropped = [];
+    writeStaged(".codex/config.toml", cleanCodexToml(toml, dropped));
+    notes.push(`~/.codex/config.toml${dropped.length ? ` (without ${dropped.join(", ")})` : ""}`);
+  }
+  // OpenCode's config
+  for (const f of ["opencode.json", "opencode.jsonc", "config.json"]) {
+    let txt; try { txt = fs.readFileSync(path.join(HOME, ".config", "opencode", f), "utf8"); } catch { continue; }
+    let j; try { j = JSON.parse(txt.replace(/^\s*\/\/.*$/gm, "")); } catch { notes.push(`not ~/.config/opencode/${f} (could not read it as JSON to strip its secrets)`); continue; }
+    const dropped = [];
+    writeStaged(`.config/opencode/${f.replace(/c$/, "")}`, JSON.stringify(stripSecretsDeep(j, dropped, ""), null, 2));
+    notes.push(`~/.config/opencode/${f}${dropped.length ? ` (without ${dropped.map((d) => d.replace(/^\./, "")).join(", ")})` : ""}`);
+  }
+  // MCP servers from ~/.claude.json (only that key: the rest is your local state).
+  const local = readJsonLoose(path.join(HOME, ".claude.json"), {});
+  if (local.mcpServers && Object.keys(local.mcpServers).length) {
+    let keep = !!flags["include-mcp-secrets"];
+    const probe = cleanMcp(local.mcpServers, false);
+    if (!keep && probe.stripped.length && rl) keep = /^y/i.test(await ask(rl, `MCP servers have secrets (${probe.stripped.join(", ")}). Copy those into the base too (the agent can read them)? [y/N] `));
+    const { servers, stripped } = cleanMcp(local.mcpServers, keep);
+    writeStaged(".lzs-mcp.json", JSON.stringify(servers));
+    notes.push(`MCP servers ${Object.keys(servers).join(", ")}${stripped.length ? ` (without ${stripped.join(", ")})` : keep && probe.stripped.length ? " (with their env/headers: --include-mcp-secrets)" : ""}`);
+  }
+  if (!fromHome.length && !staged.length) return;
+
+  const tgz = path.join(stage, "..", `${path.basename(stage)}.tgz`);
+  tmpDirs.add(tgz);
+  const excl = [".git", "node_modules", ".env", ".env.*", ".envrc", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*", "id_ecdsa*", ".npmrc", ".pypirc", ".netrc", "credentials*", "auth.json", "*.sqlite", "*.db"].map((p) => `--exclude=${p}`);
+  const r = spawnSync("tar", ["-czf", tgz, ...excl, ...(fromHome.length ? ["-C", HOME, ...fromHome] : []), ...(staged.length ? ["-C", stage, ...staged] : [])], { stdio: ["ignore", "ignore", "pipe"] });
+  if (r.status !== 0) { say(`could not pack your setup: ${safeText(r.stderr)}`); return; }
+  putFile(id, tgz, "/tmp/lzs-setup.tgz");
+  remote(id, `set -e
+cd /root && tar -xzf /tmp/lzs-setup.tgz --no-same-owner && rm -f /tmp/lzs-setup.tgz
+if [ -f .lzs-claude-settings.json ]; then node -e '
+const fs=require("fs"),f="/root/.claude/settings.json";let j={};try{j=JSON.parse(fs.readFileSync(f))}catch{}
+const mine=JSON.parse(fs.readFileSync("/root/.lzs-claude-settings.json"));
+const out={...mine,...j,env:{...(mine.env||{}),...(j.env||{})},permissions:mine.permissions||j.permissions};if(!out.permissions)delete out.permissions;
+fs.writeFileSync(f,JSON.stringify(out,null,2))'; rm -f .lzs-claude-settings.json; fi
+if [ -f .lzs-mcp.json ]; then node -e '
+const fs=require("fs"),f="/root/.claude.json";const j=JSON.parse(fs.readFileSync(f));j.mcpServers={...(j.mcpServers||{}),...JSON.parse(fs.readFileSync("/root/.lzs-mcp.json"))};fs.writeFileSync(f,JSON.stringify(j,null,2))'; rm -f .lzs-mcp.json; fi
+chmod 600 /root/.claude.json 2>/dev/null || true`);
+  for (const p of fromHome) say(`copied ~/${p}`);
+  for (const n of notes) say(`copied ${n}`);
 }
 
 // ---------- the code a session works on ----------
-// A local repo goes in as it is right now: history, branch, uncommitted and untracked files
-// (not what .gitignore ignores). The session works on branch lzs/<name>; `lzs pull` fetches it back.
-function packLocalRepo(dir) {
+// Your repo goes in as it is right now: its history as a git bundle (never .git itself: no
+// config with credentials, no hooks), tracked files as they are on disk, and untracked files that
+// .gitignore doesn't ignore, except ones that look like secrets.
+const SECRET_FILE = (p) => {
+  const b = path.basename(p);
+  if (/^\.env(\..+)?$/.test(b) && !/^\.env\.(example|sample|template|dist|defaults)$/i.test(b)) return true;
+  return /^\.envrc$|^\.npmrc$|^\.pypirc$|^\.netrc$|^\.git-credentials$|^\.pgpass$|^credentials|\.(pem|key|p12|pfx|jks|keystore|tfvars|tfstate)$|^id_(rsa|dsa|ecdsa|ed25519)|^service[-_]?account.*\.json$/i.test(b);
+};
+function stripUrlCreds(u) {
+  if (!u) return null;
+  try { const x = new URL(u); x.username = ""; x.password = ""; return x.toString(); } catch { return /^[\w.-]+@[\w.-]+:/.test(u) ? u : null; }
+}
+function packLocalRepo(dir, flags) {
   const git = (...a) => spawnSync("git", ["-C", dir, ...a], { encoding: "utf8" }).stdout?.trim();
   const top = git("rev-parse", "--show-toplevel");
   if (!top) die(`${dir} is not inside a git repository`);
   const head = git("rev-parse", "HEAD");
   if (!head) die(`${top} has no commits yet: commit once, then lzs .`);
-  if (path.resolve(top, git("rev-parse", "--git-dir")) !== path.join(top, ".git")) die(`${top} keeps its git data elsewhere (a worktree or submodule); clone it normally first`);
-  const files = spawnSync("git", ["-C", top, "ls-files", "-z", "-co", "--exclude-standard"], { maxBuffer: 256 << 20 }).stdout;
-  const tgz = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "lzs-")), "repo.tgz");
-  const r = spawnSync("tar", ["-czf", tgz, "-C", top, "--null", "-T", "-"], { input: Buffer.concat([files, Buffer.from(".git\0")]), stdio: ["pipe", "ignore", "pipe"] });
-  if (r.status !== 0) die(`could not pack ${top}: ${r.stderr}`);
-  const mb = fs.statSync(tgz).size / 1e6;
+  if (git("rev-parse", "--is-shallow-repository") === "true") die(`${top} is a shallow clone: git fetch --unshallow first (or start the session with --repo owner/name)`);
+  const z = (...a) => (spawnSync("git", ["-C", top, ...a], { maxBuffer: 256 << 20 }).stdout ?? Buffer.alloc(0)).toString("utf8").split("\0").filter(Boolean);
+  const gitlinks = new Set(z("ls-files", "-z", "-s").filter((l) => l.startsWith("160000 ")).map((l) => l.split("\t")[1]));
+  const deleted = new Set(z("ls-files", "-z", "-d"));
+  const tracked = z("ls-files", "-z", "-c").filter((p) => !deleted.has(p) && !gitlinks.has(p));
+  const untracked = z("ls-files", "-z", "-o", "--exclude-standard");
+  const blocked = flags["include-secrets"] ? [] : untracked.filter(SECRET_FILE);
+  const sendUntracked = untracked.filter((p) => flags["include-secrets"] || !SECRET_FILE(p));
+  const trackedSecrets = tracked.filter(SECRET_FILE);
+  const branch = git("symbolic-ref", "--short", "-q", "HEAD") || null;
+  const stage = mkTmp();
+  const b = spawnSync("git", ["-C", top, "bundle", "create", "-q", path.join(stage, "repo.bundle"), "HEAD", ...(branch ? [`refs/heads/${branch}`] : [])], { encoding: "utf8" });
+  if (b.status !== 0) die(`could not bundle ${top}'s history: ${safeText(b.stderr)}`);
+  const t = spawnSync("tar", ["-czf", path.join(stage, "files.tgz"), "--no-recursion", "-C", top, "--null", "-T", "-"], { input: Buffer.from([...tracked, ...sendUntracked].map((p) => p + "\0").join("")), stdio: ["pipe", "ignore", "pipe"] });
+  if (t.status !== 0) die(`could not pack ${top}: ${safeText(t.stderr)}`);
+  fs.writeFileSync(path.join(stage, "deleted"), [...deleted].map((p) => p + "\0").join(""));
+  const pack = path.join(stage, "pack.tar");
+  const p = spawnSync("tar", ["-cf", pack, "-C", stage, "repo.bundle", "files.tgz", "deleted"], { stdio: ["ignore", "ignore", "pipe"] });
+  if (p.status !== 0) die(`could not pack ${top}: ${safeText(p.stderr)}`);
+  const mb = fs.statSync(pack).size / 1e6;
   if (mb > 500) die(`${top} packs to ${mb.toFixed(0)} MB, too big to send; use --repo owner/name to clone it in the sandbox`);
-  return { top, head, tgz, mb, name: path.basename(top) };
+  const meta = { top, head, branch, name: path.basename(top), origin: stripUrlCreds(git("remote", "get-url", "origin")), mb, tracked: tracked.length, untracked: sendUntracked, blocked, trackedSecrets };
+  fs.writeFileSync(path.join(stage, "meta.json"), JSON.stringify(meta));
+  return { ...meta, pack, stage };
+}
+// A pack made by `lzs fan` for its sessions (all get the same snapshot of your working tree).
+function loadPack(dir) {
+  const real = fs.realpathSync(dir);
+  if (path.dirname(real) !== fs.realpathSync(os.tmpdir()) || !/^lzs-/.test(path.basename(real))) die("--pack: not an lzs pack");
+  const meta = readJsonLoose(path.join(real, "meta.json"), null) ?? die("--pack: not an lzs pack");
+  return { ...meta, pack: path.join(real, "pack.tar"), stage: real };
+}
+
+// Say what goes up, and ask about untracked files on a terminal.
+async function confirmPack(pack, flags) {
+  say(`sending ${bold(pack.name)}: ${plural(pack.tracked, "tracked file")}, history as a git bundle (${pack.mb.toFixed(1)} MB)${pack.origin ? `, origin ${pack.origin}` : ""}`);
+  const list = (xs) => xs.slice(0, 15).join(", ") + (xs.length > 15 ? `, … (${xs.length - 15} more)` : "");
+  if (pack.blocked.length) say(`${yellow("not sent")} (they look like secrets; --include-secrets sends them): ${list(pack.blocked)}`);
+  if (pack.trackedSecrets.length) warnLoud(`tracked in git, so sent with the history: ${list(pack.trackedSecrets)}`);
+  if (!pack.untracked.length) return;
+  say(`untracked, not ignored, sent too: ${list(pack.untracked)}`);
+  if (flags.yes || !interactive()) return;
+  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+  const a = (await rl.question(`send ${plural(pack.untracked.length, "untracked file")}? [Y/n] `)).trim();
+  rl.close();
+  if (/^n/i.test(a)) die("nothing sent. Commit, ignore or move the files you don't want sent, or add them to .gitignore");
 }
 
 const isDir = (d) => { try { return fs.statSync(path.resolve(String(d).replace(/^~(?=\/|$)/, HOME))).isDirectory(); } catch { return false; } };
@@ -612,106 +1120,191 @@ function noStrayTask(pos, flags, example) {
   const stray = pos.slice(!flags.repo && pos[0] && isDir(pos[0]) ? 1 : 0);
   if (!stray.length) return;
   const task = stray.join(" ");
-  if (pos.length === 1 && stray.length === 1 && !/\s/.test(task)) die(`'${task}' is not a command or a folder. See: lzs --help (a task goes after -p "...")`);
-  die(`'${trunc(task, 60)}' is not a command or a folder. To give the agent a task, use -p "...":\n  ${example(task)}`);
+  if (pos.length === 1 && stray.length === 1 && !/\s/.test(task)) die(`'${safeText(task)}' is not a command or a folder. See: lzs --help (a task goes after -p "...")`);
+  die(`'${trunc(safeText(task), 60)}' is not a command or a folder. To give the agent a task, use -p "...":\n  ${example(task)}`);
 }
 
 function repoFromArgs(rest, flags) {
-  if (flags.repo) return { kind: "github", slug: flags.repo.replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "") };
+  if (flags.repo) return { kind: "github", slug: flags.repo };
   const dir = rest[0];
   if (!dir) return null;
   const p = path.resolve(dir.replace(/^~(?=\/|$)/, HOME));
   if (fs.existsSync(p) && fs.statSync(p).isDirectory()) return { kind: "local", dir: p };
-  die(`'${dir}' is not a command or a folder. See: lzs --help`);
+  die(`'${safeText(dir)}' is not a command or a folder. See: lzs --help`);
+}
+
+// A GitHub token for this session only, if you gave one (never your gh login): the agent can
+// read it, so make it a fine-grained token for the one repository.
+function sessionGithubToken(flags) {
+  const t = flags["github-token"] ?? process.env.LZS_GH_TOKEN ?? "";
+  if (!t) return "";
+  if (!/^[A-Za-z0-9_]{20,255}$/.test(t)) die("--github-token / LZS_GH_TOKEN does not look like a GitHub token");
+  if (!t.startsWith("github_pat_")) warnLoud(`the GitHub token (${redact(t)}) is not a fine-grained one (github_pat_…). The agent in the session can read it and use it on everything it can reach. Make one for this repository only: https://github.com/settings/personal-access-tokens/new`);
+  else warnLoud(`the agent in the session can read the GitHub token you gave (${redact(t)}); keep it to this repository and short-lived`);
+  return t;
 }
 
 // ---------- sessions ----------
-async function newSession({ name, agent, prompt, repo, pack, attach, check, group }) {
+function agentReady(cfg, agent) {
+  if (cfg.installed && !cfg.installed.includes(agent)) die(`${agent} is not installed in your base. lzs init --agents claude,codex,opencode installs it`);
+  if (cfg.logins && !cfg.logins.includes(agent)) die(`your base has no ${agent} login: ${AGENTS[agent].hint}; then lzs init again`);
+}
+
+async function newSession({ name, agent, prompt, repo, pack, attach, check, group, ghToken, flags }) {
   const cfg = needConfig();
-  if (!AGENTS[agent]) die(`unknown agent '${agent}'`);
+  agentReady(cfg, agent);
   const t0 = Date.now();
-  const sb = lizard(["sandbox", "restore", cfg.snapshot, "--timeout", "0", "-p", cfg.projectId], { json: true });
-  const rec = { id: sb.id, agent, createdAt: new Date().toISOString(), ...(prompt ? { prompt: trunc(prompt, 200) } : {}), ...(check ? { check } : {}), ...(group ? { group } : {}) };
+  // A sandbox of its own from the base, with a Lizard key of its own (--with-token: scoped to the
+  // project, deleted with the sandbox; the watchdog pauses with it). For a GitHub repository, a
+  // grant for that one repository (--repo), unless --no-github or a token of your own.
+  const args = ["sandbox", "create", "--snapshot", cfg.snapshot, "--timeout", "0", "-p", cfg.projectId, "--with-token"];
+  const grant = repo?.kind === "github" && !flags["no-github"] && !ghToken;
+  let made = lizardTry(grant ? [...args, "--repo", repo.slug] : args);
+  let granted = grant && made.ok;
+  if (!made.ok && grant && /^GITHUB_/.test(String(made.error.code ?? ""))) {
+    say(`no GitHub grant for ${repo.slug} (${made.error.message}); cloning it without one (read only, public repositories)`);
+    made = lizardTry(args);
+    granted = false;
+  }
+  if (!made.ok) { const rf = refusal(made.error, `a sandbox for ${name}`); die(rf.text, rf.limit ? EXIT_LIMIT : 1); }
+  const sb = made.data;
+  recordCreated("sandboxes", sb.id);
+  const now = new Date().toISOString();
+  const rec = { v: 5, id: sb.id, agent, snapshot: cfg.snapshot, createdAt: now, wokeAt: now, ...(prompt ? { prompt: trunc(prompt, 200) } : {}), ...(check ? { check } : {}), ...(group ? { group } : {}), ...(flags["max-hours"] ? { maxHours: Number(flags["max-hours"]) } : {}), ...(flags["idle-minutes"] !== undefined ? { idleMinutes: Number(flags["idle-minutes"]) } : {}) };
   updateSessions((all) => { all[name] = rec; });
   let cwd = "/workspace", setup = "";
   if (repo?.kind === "local") {
-    lizard(["sandbox", "files", "put", sb.id, pack.tgz, "/tmp/lzs-repo.tgz"]);
+    putFile(sb.id, pack.pack, "/tmp/lzs-pack.tar");
     cwd = `/workspace/${pack.name}`;
-    setup = `mkdir -p ${q(cwd)} && tar -xzf /tmp/lzs-repo.tgz -C ${q(cwd)} && rm /tmp/lzs-repo.tgz && cd ${q(cwd)} && git checkout -q -b lzs/${name} && git rev-parse HEAD > ${REMOTE}/base`;
+    setup = `d=${bv(cwd)}; mkdir -p /tmp/lzs-pack && tar -xf /tmp/lzs-pack.tar -C /tmp/lzs-pack && rm -f /tmp/lzs-pack.tar
+git clone -q /tmp/lzs-pack/repo.bundle "$d" && cd "$d" && git remote remove origin
+${pack.origin ? `git remote add origin ${bv(pack.origin)}` : ""}
+git checkout -q -B ${bv(`lzs/${name}`)} ${bv(pack.head)}
+tar -xzf /tmp/lzs-pack/files.tgz -C "$d" --no-same-owner
+[ -s /tmp/lzs-pack/deleted ] && xargs -0 -r rm -f -- < /tmp/lzs-pack/deleted
+rm -rf /tmp/lzs-pack; git rev-parse HEAD > ${REMOTE}/base`;
     rec.repo = { kind: "local", name: pack.name, local: pack.top, path: cwd, base: pack.head, branch: `lzs/${name}` };
   } else if (repo?.kind === "github") {
     const short = repo.slug.split("/").pop();
     cwd = `/workspace/${short}`;
-    setup = `cd /workspace && if [ -n "$GH_TOKEN" ]; then gh repo clone ${q(repo.slug)} ${q(short)} -- -q; else git clone -q ${q(`https://github.com/${repo.slug}.git`)} ${q(short)}; fi && cd ${q(short)} && git checkout -q -b lzs/${name} && git rev-parse HEAD > ${REMOTE}/base`;
-    rec.repo = { kind: "github", name: short, slug: repo.slug, path: cwd, branch: `lzs/${name}` };
+    setup = granted
+      // Lizard clones it (with the grant's credential helper); wait for that clone to finish.
+      ? `d=${bv(cwd)}; for i in $(seq 1 240); do pgrep -x git >/dev/null || { [ -d "$d/.git" ] && break; }; sleep 0.5; done
+[ -d "$d/.git" ] || git clone -q ${bv(`https://github.com/${repo.slug}.git`)} "$d"
+cd "$d" && git checkout -q -b ${bv(`lzs/${name}`)} && git rev-parse HEAD > ${REMOTE}/base`
+      : `d=${bv(cwd)}
+${ghToken ? `git config --global credential.https://github.com.helper '!f() { test "$1" = get && echo username=x-access-token && echo "password=$(cat ${REMOTE}/gh-token)"; }; f'` : ""}
+git clone -q ${bv(`https://github.com/${repo.slug}.git`)} "$d" && cd "$d" && git checkout -q -b ${bv(`lzs/${name}`)} && git rev-parse HEAD > ${REMOTE}/base`;
+    rec.repo = { kind: "github", name: short, slug: repo.slug, path: cwd, branch: `lzs/${name}`, grant: granted, token: !!ghToken };
   }
+  if (ghToken) putSecretText(sb.id, ghToken, `${REMOTE}/gh-token`);
   const r = remote(sb.id, `set -e
-GH_TOKEN=; [ -f ${REMOTE}/env ] && set -a && . ${REMOTE}/env && set +a
-echo ${q(sb.id)} > ${REMOTE}/id; echo ${q(name)} > ${REMOTE}/name; echo ${q(cwd)} > ${REMOTE}/cwd
-printf '%s' ${q(check ?? "")} > ${REMOTE}/check; printf '%s' ${q(prompt ?? "")} > ${REMOTE}/prompt
+L=${REMOTE}
+printf %s ${bv(sb.id)} > $L/id; printf %s ${bv(name)} > $L/name; printf %s ${bv(cwd)} > $L/cwd
+printf %s ${bv(check ?? "")} > $L/check; printf %s ${bv(prompt ?? "")} > $L/prompt
+${flags["max-hours"] ? `printf %s ${bv(Number(flags["max-hours"]))} > $L/max_hours` : ""}
+${flags["idle-minutes"] !== undefined ? `printf %s ${bv(Number(flags["idle-minutes"]))} > $L/idle_minutes` : ""}
 ${setup}
-node -e 'const fs=require("fs"),f="/root/.claude.json";const j=JSON.parse(fs.readFileSync(f));j.projects[${JSON.stringify(cwd)}]={hasTrustDialogAccepted:true,hasCompletedProjectOnboarding:true};fs.writeFileSync(f,JSON.stringify(j))' 2>/dev/null || true
-${REMOTE}/start.sh ${q(agent)} ${prompt ? "prompt" : "new"} ${q(b64(prompt ?? ""))}`, { check: false });
+CWD=${bv(cwd)} node -e 'const fs=require("fs"),f="/root/.claude.json";const j=JSON.parse(fs.readFileSync(f));j.projects=j.projects||{};j.projects[process.env.CWD]={hasTrustDialogAccepted:true,hasCompletedProjectOnboarding:true};fs.writeFileSync(f,JSON.stringify(j))' 2>/dev/null || true
+CWD=${bv(cwd)} node -e 'const fs=require("fs"),f="/root/.codex/config.toml";fs.mkdirSync("/root/.codex",{recursive:true});let t="";try{t=fs.readFileSync(f,"utf8")}catch{};const h="[projects."+JSON.stringify(process.env.CWD)+"]";if(!t.includes(h))fs.writeFileSync(f,t+"\\n"+h+"\\ntrust_level = \\"trusted\\"\\n")' 2>/dev/null || true
+$L/start.sh ${bv(agent)} ${prompt ? "prompt" : "new"} ${bv(b64(prompt ?? ""))}
+# An agent that cannot start (not installed, crashed) exits at once: say so instead of "ready".
+for i in 1 2 3 4; do sleep 0.5; if tmux capture-pane -p -t agent | grep -q '\\[agent exited'; then echo AGENT_EXITED; tmux capture-pane -p -t agent | grep -v '^\\s*$' | tail -8; exit 0; fi; done
+[ -s /root/.lizard/config.json ] && echo HAS_KEY || true`, { check: false });
+  rec.wokeAt = new Date().toISOString();
   updateSessions((all) => { all[name] = rec; });
-  if (r.status !== 0) die(`${name} (${sb.id}) started, but setting it up failed:\n${(r.stderr || r.stdout).trim().slice(-1500)}`);
-  say(`${bold(name)} (${sb.id}, ${agent}${rec.repo ? `, ${rec.repo.name} on ${rec.repo.branch}` : ""}) ready in ${secs(t0)} s${attach ? " · Ctrl-b d to detach" : ""}`);
+  if (r.status !== 0) die(`${name} (${sb.id}) started, but setting it up failed:\n${safeText(r.stderr || r.stdout).trim().slice(-1500)}`);
+  if (/^AGENT_EXITED$/m.test(r.stdout)) {
+    const screen = safeText(r.stdout.split(/^AGENT_EXITED$/m)[1] ?? "").trim();
+    lizard(["sandbox", "rm", sb.id, "--yes"], { check: false });
+    recordCreated("sandboxes", sb.id, false);
+    updateSessions((all) => { delete all[name]; });
+    die(`${name}: ${agent} exited as soon as it started, so the session was deleted. Its screen:\n${screen.split("\n").map((l) => "  " + l).join("\n")}`);
+  }
+  if (!/^HAS_KEY$/m.test(r.stdout)) say(`${name} has no sandbox key yet, so it may not be able to pause itself; lzs pauses it after its --max-hours when you next run lzs`);
+  say(`${bold(name)} (${sb.id}, ${agent}${rec.repo ? `, ${rec.repo.name} on ${rec.repo.branch}${rec.repo.grant ? ", GitHub grant for this repo" : ""}` : ""}) ready in ${secs(t0)} s${attach ? " · Ctrl-b d to detach" : ""}`);
   return attach ? shell(sb.id) : 0;
 }
 
 async function cmdNew(rest, flags) {
   noStrayTask(rest, flags, (t) => `lzs ${rest[0] && isDir(rest[0]) ? rest[0] + " " : ""}-p ${JSON.stringify(t)}`);
   const cfg = needConfig();
-  // No terminal to attach to (a script, CI, an agent): start it in the background instead.
+  const agent = flags.agent || cfg.agent;
+  agentReady(cfg, agent);
   if (!flags["no-attach"] && !interactive()) { flags["no-attach"] = true; flags.__noTty = true; }
   const repo = repoFromArgs(rest, flags);
-  const pack = repo?.kind === "local" ? packLocalRepo(repo.dir) : null;
-  if (pack && pack.mb > 20) say(`sending ${pack.name} (${pack.mb.toFixed(0)} MB)…`);
+  let pack = null;
+  if (repo?.kind === "local") {
+    pack = flags.pack ? loadPack(flags.pack) : packLocalRepo(repo.dir, flags);
+    if (!flags.pack) await confirmPack(pack, flags);
+  }
+  const ghToken = repo?.kind === "github" ? sessionGithubToken(flags) : "";
   const name = flags.name || nextNames(1)[0];
   if (sessions()[name]) die(`session '${name}' exists. Use: lzs resume ${name}`);
-  try {
-    const code = await newSession({ name, agent: flags.agent || cfg.agent, prompt: flags.prompt, repo, pack, attach: !flags["no-attach"], check: flags.check, group: flags.group });
-    if (flags.__noTty) say(`not attached (no terminal here); it runs in the background. ${bold(`lzs peek ${name}`)} to see it, ${bold(`lzs send ${name} "…"`)} to type into it, ${bold(`lzs resume ${name}`)} from a terminal to attach`);
-    return code;
-  } finally { if (pack) fs.rmSync(path.dirname(pack.tgz), { recursive: true, force: true }); }
+  const code = await newSession({ name, agent, prompt: flags.prompt, repo, pack, attach: !flags["no-attach"], check: flags.check, group: flags.group, ghToken, flags });
+  if (flags.__noTty) say(`not attached (no terminal here); it runs in the background. ${bold(`lzs peek ${name}`)} to see it, ${bold(`lzs send ${name} "…"`)} to type into it, ${bold(`lzs resume ${name}`)} from a terminal to attach`);
+  if (pack && !flags.pack) rmTmp(pack.stage);
+  return code;
 }
 
 // N agents on the same task (or none), started in parallel, nobody attached.
 async function cmdFan(rest, flags) {
   const n = /^\d+$/.test(rest[0] ?? "") ? parseInt(rest[0], 10) : NaN;
-  const usage = `usage: lzs fan <1-50> [. | DIR | --repo owner/name] -p "task" [--check CMD]`;
-  if (!(n >= 1 && n <= 50)) die(usage);
+  const usage = `usage: lzs fan <1-${FAN_MAX}> [. | DIR | --repo owner/name] -p "task" [--check CMD]`;
+  if (!(n >= 1 && n <= FAN_MAX)) die(usage);
   const pos = rest.slice(1);
   const where = !flags.repo && pos[0] && isDir(pos[0]) ? pos[0] + " " : flags.repo ? `--repo ${flags.repo} ` : "";
   noStrayTask(pos, flags, (t) => `lzs fan ${n} ${where}-p ${JSON.stringify(t)}`);
   if (!flags.prompt?.trim()) die(`lzs fan needs the task, given with -p:\n  lzs fan ${n} ${where || ". "}-p "fix the failing test"\n${usage}`);
   const cfg = needConfig();
+  const agent = flags.agent || cfg.agent;
+  agentReady(cfg, agent);
+  if (n > FAN_CONFIRM && !flags.yes) {
+    const cost = `~$${(n * (RATE[cfg.size] ?? 0)).toFixed(2)}/h while they run`;
+    if (!interactive()) die(`lzs fan ${n} starts ${n} sandboxes (${cost}); add --yes to confirm`);
+    const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+    const a = (await rl.question(`start ${n} sandboxes (${cost})? [y/N] `)).trim();
+    rl.close();
+    if (!/^y/i.test(a)) die("nothing started");
+  }
   const repo = repoFromArgs(pos, flags);
-  if (repo?.kind === "local") packLocalRepo(repo.dir); // fail early, before starting anything
+  let pack = null;
+  if (repo?.kind === "local") { pack = packLocalRepo(repo.dir, flags); await confirmPack(pack, flags); }
+  if (repo?.kind === "github") sessionGithubToken(flags);
   const names = nextNames(n);
   const group = `fan-${Date.now().toString(36)}`;
   const t0 = Date.now();
-  say(`starting ${plural(n, `${flags.agent || cfg.agent} session`)}${repo ? ` on ${path.basename(repo.dir ?? repo.slug)}` : ""}…`);
-  // Each one in its own lzs process, so they really run side by side.
-  const args = (nm) => ["new", ...(repo?.kind === "local" ? [repo.dir] : []), ...(repo?.kind === "github" ? ["--repo", repo.slug] : []), "--name", nm, "--detach", "--group", group, ...(flags.agent ? ["--agent", flags.agent] : []), ...(flags.prompt ? ["--prompt", flags.prompt] : []), ...(flags.check ? ["--check", flags.check] : [])];
+  say(`starting ${plural(n, `${agent} session`)}${repo ? ` on ${path.basename(repo.dir ?? repo.slug)}` : ""}…`);
+  // Each one in its own lzs process, so they really run side by side. A GitHub token goes by
+  // environment, never on a command line.
+  const env = { ...process.env, ...(flags["github-token"] ? { LZS_GH_TOKEN: flags["github-token"] } : {}) };
+  const args = (nm) => ["new", ...(repo?.kind === "local" ? [repo.dir, "--pack", pack.stage] : []), ...(repo?.kind === "github" ? ["--repo", repo.slug] : []), "--name", nm, "--detach", "--yes", "--group", group, "--agent", agent, "--prompt", flags.prompt, ...(flags.check ? ["--check", flags.check] : []), ...(flags["max-hours"] ? ["--max-hours", flags["max-hours"]] : []), ...(flags["idle-minutes"] !== undefined ? ["--idle-minutes", flags["idle-minutes"]] : []), ...(flags["no-idle-pause"] ? ["--no-idle-pause"] : []), ...(flags["no-github"] ? ["--no-github"] : [])];
+  let limited = null;
   const results = await pool(names, 10, (nm) => new Promise((resolve) => {
-    const p = spawn(process.execPath, [process.argv[1], ...args(nm)], { stdio: ["ignore", "ignore", "pipe"], env: process.env });
+    if (limited) { console.error(`  ${dim("-")} ${nm}: not started (limit)`); return resolve(false); }
+    const p = spawn(process.execPath, [process.argv[1], ...args(nm)], { stdio: ["ignore", "ignore", "pipe"], env });
     let err = ""; p.stderr.on("data", (d) => (err += d));
     p.on("close", (code) => {
       const took = (err.match(/ready in ([\d.]+) s/) ?? [])[1];
-      console.error(code === 0 ? `  ${green("✓")} ${nm}${took ? dim(` ${took} s`) : ""}` : `  ${red("✗")} ${nm}: ${err.trim().split("\n").slice(-2).join(" ")}`);
+      if (code === EXIT_LIMIT && !limited) limited = safeText(err).trim().split("\n").filter(Boolean).slice(-2).join("\n  ");
+      console.error(code === 0 ? `  ${green("✓")} ${nm}${took ? dim(` ${took} s`) : ""}` : `  ${red("✗")} ${nm}: ${code === EXIT_LIMIT ? "limit reached" : safeText(err).trim().split("\n").slice(-2).join(" ")}`);
       resolve(code === 0);
     });
   }));
+  if (pack) rmTmp(pack.stage);
   const ok = results.filter(Boolean).length;
-  console.error(`\n${ok} of ${n} running after ${secs(t0)} s · ${bold("lzs watch")} to follow them${flags.check ? `; each runs ${bold(flags.check)} when it finishes` : ""} · ${bold("lzs diff")} to compare · ${bold("lzs pick <name>")} to keep the best`);
-  return ok === n ? 0 : 1;
+  if (limited) console.error(`\n${red("lzs: ")}${limited.replace(/^lzs: /, "")}`);
+  console.error(`\n${ok} of ${n} running after ${secs(t0)} s · ${bold("lzs watch")} to follow them${flags.check ? `; each runs ${bold(safeText(flags.check))} when it finishes` : ""} · ${bold("lzs diff")} to compare · ${bold("lzs pick <name>")} to keep the best`);
+  return ok === n ? 0 : limited ? EXIT_LIMIT : 1;
 }
 
-async function wake(name, v, live) {
+async function wake(name, v, live, { agent = true } = {}) {
   if (live?.status === "paused" || live?.status === "pausing") {
     const t0 = Date.now();
     lizard(["sandbox", "resume", v.id]);
-    remote(v.id, `${REMOTE}/start.sh ${q(v.agent)} continue`);
+    if (agent) remote(v.id, `${REMOTE}/start.sh ${bv(v.agent)} continue`);
+    updateSessions((all) => { if (all[name]) all[name].wokeAt = new Date().toISOString(); });
+    v.wokeAt = new Date().toISOString();
     say(`${bold(name)} woke in ${secs(t0)} s`);
     return true;
   }
@@ -721,9 +1314,9 @@ async function wake(name, v, live) {
 async function cmdResume(ref, flags) {
   const cfg = needConfig();
   const [name, v] = findSession(ref, { announce: true });
-  const live = liveSandboxes(cfg).get(v.id);
+  const live = liveSandboxes(cfg, { skip: [name] }).get(v.id);
   if (!live) die(`${name}'s sandbox ${v.id} is gone. Remove it with: lzs rm ${name}`);
-  if (!(await wake(name, v, live))) remote(v.id, `${REMOTE}/start.sh ${q(v.agent)} continue`); // no-op when the agent runs
+  if (!(await wake(name, v, live))) remote(v.id, `${REMOTE}/start.sh ${bv(v.agent)} continue`); // no-op when the agent runs
   if (flags["no-attach"]) return 0;
   if (!interactive()) {
     say(`${name} is running; not attached (no terminal here). ${bold(`lzs peek ${name}`)} to see it, ${bold(`lzs send ${name} "…"`)} to type into it, ${bold(`lzs resume ${name}`)} from a terminal to attach`);
@@ -748,7 +1341,7 @@ async function cmdWatch(flags) {
   const every = Math.max(3, parseInt(flags.every ?? "5", 10)) * 1000;
   const prev = new Map();
   const restore = () => { if (tty) process.stdout.write("\x1b[?25h\x1b[?1049l"); };
-  process.on("SIGINT", () => { restore(); process.exit(0); });
+  process.on("exit", restore);
   if (tty) process.stdout.write("\x1b[?1049h\x1b[?25l");
   for (;;) {
     const entries = byName(sessions());
@@ -763,16 +1356,15 @@ async function cmdWatch(flags) {
   }
 }
 
-// The agent's screen right now, without attaching.
+// The agent's screen right now, without attaching. Colors on a terminal, nothing else.
 async function cmdPeek(ref, flags) {
   const cfg = needConfig();
   const [name, v] = findSession(ref);
   const st = liveSandboxes(cfg).get(v.id)?.status ?? "gone";
   if (st !== "running") die(`${name} is ${st}${st === "paused" || st === "pausing" ? ` (lzs resume ${name})` : ""}`);
-  const n = Math.max(1, parseInt(flags.lines ?? "40", 10) || 40);
+  const n = Math.max(1, Math.min(5000, parseInt(flags.lines ?? "40", 10) || 40));
   const r = remote(v.id, `tmux has-session -t agent 2>/dev/null || { echo NOAGENT; exit 0; }; tmux capture-pane -p ${tty ? "-e" : ""} -t agent -S -${n} | sed -e 's/[[:space:]]*$//' | cat -s`);
-  const lines = (tty ? r.stdout : noAnsi(r.stdout)).split("\n");
-  // No blank padding: the pane is as tall as the window it was started for.
+  const lines = (tty ? safeSgr(r.stdout) : safeText(r.stdout)).split("\n");
   while (lines.length && !plain(lines.at(-1)).trim()) lines.pop();
   while (lines.length && !plain(lines[0]).trim()) lines.shift();
   console.log(bold(`── ${name}`) + dim(` · ${v.id}${v.repo ? ` · ${v.repo.name}` : ""}${ref ? "" : " (the newest session)"} ──`));
@@ -781,7 +1373,39 @@ async function cmdPeek(ref, flags) {
   return 0;
 }
 
-// Type into the agent without attaching: a follow-up, an answer, a new task.
+// Type into the agent without attaching: a follow-up, an answer, a new task. Waits until the
+// agent is up and its screen has settled, types the text, then presses Enter on its own, and
+// checks that it went in (Enter again once if the text is still sitting in the input).
+const SEND_SH = (text) => String.raw`
+t=${bv(text)}
+created=$(tmux display -p -t agent '#{session_created}' 2>/dev/null) || { echo NOAGENT; exit 0; }
+prev=""; stable=0; ready=0
+for i in $(seq 1 120); do
+  s=$(tmux capture-pane -p -t agent 2>/dev/null)
+  tail=$(printf '%s' "$s" | grep -v '^\s*$' | tail -12)
+  printf '%s' "$tail" | grep -q '\[agent exited' && { echo EXITED; exit 0; }
+  if printf '%s' "$tail" | grep -qiE 'esc to interrupt|ctrl\+c to interrupt'; then ready=1; break; fi
+  if [ -n "$(printf '%s' "$s" | tr -d '[:space:]')" ] && [ $(( $(date +%s) - created )) -ge 3 ]; then
+    if [ "$s" = "$prev" ]; then stable=$((stable + 1)); else stable=0; fi
+    [ $stable -ge 3 ] && { ready=1; break; }
+  fi
+  prev="$s"; sleep 0.5
+done
+[ $ready = 1 ] || echo NOTREADY
+tmux send-keys -t agent -l -- "$t"
+sleep 0.5
+tmux send-keys -t agent Enter
+probe=$(printf '%s' "$t" | tr '\n' ' ' | sed 's/[[:space:]]*$//' | tail -c 24)
+for i in 1 2 3 4 5 6; do
+  sleep 0.5
+  s=$(tmux capture-pane -p -t agent | grep -v '^\s*$' | tail -6)
+  printf '%s' "$s" | grep -qiE 'esc to interrupt|ctrl\+c to interrupt' && { echo SENT; exit 0; }
+done
+if [ -n "$probe" ] && tmux capture-pane -p -t agent | grep -v '^\s*$' | tail -4 | grep -qF -- "$probe"; then
+  tmux send-keys -t agent Enter; sleep 1.5; echo SENT_RETRY
+else echo SENT; fi
+`.replace(/\\\$\{/g, "${");
+
 async function cmdSend(ref, text, flags) {
   const cfg = needConfig();
   if (!text) die(`usage: lzs send <name> "text"  |  lzs send --all "text"`);
@@ -790,9 +1414,13 @@ async function cmdSend(ref, text, flags) {
   await pool(targets, 10, async ([name, v]) => {
     const l = live.get(v.id);
     if (!l) { say(`${name} is gone, skipped`); return; }
-    if (await wake(name, v, l)) await sleepMs(4000); // let the agent come up before typing
-    const r = await remoteAsync(v.id, `tmux send-keys -t agent -l ${q(text)} && sleep 0.3 && tmux send-keys -t agent Enter`);
-    say(r.status === 0 ? `${name} ← ${trunc(text, 60)}` : `${name}: send failed (${lizardError(r).split("\n").at(-1)})`);
+    await wake(name, v, l);
+    const r = await remoteAsync(v.id, SEND_SH(text), { timeoutMs: 120000 });
+    const out = r.stdout ?? "";
+    if (r.status !== 0) say(`${name}: send failed (${lizardError(r).split("\n").at(-1)})`);
+    else if (/^NOAGENT$/m.test(out)) say(`${name}: no agent running (lzs resume ${name})`);
+    else if (/^EXITED$/m.test(out)) say(`${name}: the agent has exited; nothing sent (lzs resume ${name} to look)`);
+    else say(`${name} ← ${trunc(oneLine(text), 60)}${/NOTREADY/.test(out) ? dim(" (the agent never looked ready; check with lzs peek)") : ""}${/SENT_RETRY/.test(out) ? dim(" (needed a second Enter)") : ""}`);
   });
   return 0;
 }
@@ -800,56 +1428,112 @@ async function cmdSend(ref, text, flags) {
 // A commit title for the session's work: the task it was given (first line, ~72 characters),
 // else what the agent's terminal title says it is doing, else "lzs: <name>". A shell expression.
 function commitTitle(name, v, flags) {
-  if (flags.message) return q(flags.message);
+  if (flags.message) return bv(flags.message);
   const task = (v.prompt ?? "").split("\n").map((l) => l.trim()).find(Boolean)?.replace(/…$/, "");
-  if (task) return q(task.length > 72 ? task.slice(0, 71).trimEnd() + "…" : task);
-  return `"$(t=$(tmux display -p -t agent '#{pane_title}' 2>/dev/null | sed 's/^[^[:alnum:]]*//'); case "$t" in ''|e2b*|localhost|bash|[Cc]laude*|codex|opencode) echo ${q(`lzs: ${name}`)} ;; *) echo "$t" | head -c 72 ;; esac)"`;
+  if (task) return bv(task.length > 72 ? task.slice(0, 71).trimEnd() + "…" : task);
+  return `"$(t=$(tmux display -p -t agent '#{pane_title}' 2>/dev/null | tr -d '\\000-\\037' | sed 's/^[^[:alnum:]]*//'); case "$t" in ''|e2b*|localhost|bash|[Cc]laude*|codex|opencode) printf %s ${bv(`lzs: ${name}`)} ;; *) printf %s "$t" | head -c 72 ;; esac)"`;
 }
 
 // Has the session changed anything since it started (commits, edits, new files)? null = can't tell.
 function hasChanges(v) {
   if (!v.repo) return null;
-  const r = remote(v.id, `cd ${q(v.repo.path)} && export GIT_INDEX_FILE=$(mktemp) && cp .git/index $GIT_INDEX_FILE 2>/dev/null; git add -A >/dev/null 2>&1; \
+  const r = remote(v.id, `cd ${bv(v.repo.path)} && export GIT_INDEX_FILE=$(mktemp) && cp .git/index $GIT_INDEX_FILE 2>/dev/null; git add -A >/dev/null 2>&1; \
 if git diff --cached --quiet $(cat ${REMOTE}/base); then echo NOCHANGES; else echo CHANGES; fi; rm -f $GIT_INDEX_FILE`, { check: false });
   return /^CHANGES$/m.test(r.stdout) ? true : /^NOCHANGES$/m.test(r.stdout) ? false : null;
 }
 
+// The agent's conversations, back where your agents keep theirs: Claude Code's under
+// ~/.claude/projects/<your repo's path>/ (so `claude --resume` in the repo lists them), Codex's
+// under ~/.codex/sessions/. Transcript files only (.jsonl/.json, safe names, mode 600).
+const claudeDirName = (p) => String(p).replace(/[^a-zA-Z0-9]/g, "-");
+async function syncTranscripts(name, v, cfg, flags) {
+  if (flags["no-sync"] || cfg.sync === false) return 0;
+  const r = remote(v.id, TX_SH, { check: false });
+  if (!/^PACKED$/m.test(r.stdout)) return 0;
+  const d = mkTmp(), f = path.join(d, "tx.tgz");
+  const g = lizard(["sandbox", "files", "get", v.id, "/tmp/lzs-tx.tgz", f], { check: false });
+  remote(v.id, "rm -f /tmp/lzs-tx.tgz", { check: false });
+  if (g.status !== 0) { say(`${name}: could not fetch its transcripts (${lizardError(g)})`); rmTmp(d); return 0; }
+  const sandboxDir = claudeDirName(v.repo?.path ?? "/workspace");
+  const localDir = v.repo?.local ? claudeDirName(v.repo.local) : null;
+  let n = 0;
+  const where = new Set();
+  for (const e of tarEntries(gunzip(f))) {
+    if (e.type !== "0") continue;
+    const rel = safeRel(e.name);
+    if (!rel) continue;
+    let dest, m;
+    if ((m = rel.match(/^\.claude\/projects\/([A-Za-z0-9._-]{1,200})\/((?:[A-Za-z0-9._-]{1,200}\/){0,3}[A-Za-z0-9._-]{1,200}\.jsonl?)$/))) {
+      const dir = m[1] === sandboxDir && localDir ? localDir : m[1];
+      if (dir === "." || dir === "..") continue;
+      dest = path.join(HOME, ".claude", "projects", dir, m[2]);
+      where.add(`~/.claude/projects/${dir}`);
+    } else if ((m = rel.match(/^\.codex\/sessions\/((?:\d{4}\/\d{2}\/\d{2}\/)?[A-Za-z0-9._-]{1,200}\.jsonl)$/))) {
+      dest = path.join(HOME, ".codex", "sessions", m[1]);
+      where.add("~/.codex/sessions");
+    } else continue;
+    if (dest.split(path.sep).includes("..")) continue;
+    try {
+      const st = fs.lstatSync(dest);
+      if (!st.isFile() || st.size >= e.data.length) continue; // a link, or what's here is as new
+    } catch {}
+    fs.mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
+    const tmp = `${dest}.lzs-${process.pid}.tmp`;
+    fs.writeFileSync(tmp, e.data, { mode: 0o600 });
+    fs.renameSync(tmp, dest);
+    n++;
+  }
+  rmTmp(d);
+  if (n) say(`${name}: ${plural(n, "transcript")} → ${[...where].join(", ")}`);
+  return n;
+}
+
 // The work, back on this machine. A session on your local repo comes back as branch lzs/<name>
-// in that repo (git fetch from a bundle: no GitHub needed); otherwise /workspace is copied here.
+// in that repo (git fetch from a bundle: no GitHub needed); otherwise /workspace is copied into a
+// new, empty directory, without .git and without execute bits.
 async function cmdPull(ref, flags) {
   const cfg = needConfig();
   const [name, v] = findSession(ref);
   const live = liveSandboxes(cfg).get(v.id);
   if (!live) die(`${name}'s sandbox is gone`);
   await wake(name, v, live);
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "lzs-"));
-  try {
-    if (v.repo?.kind === "local" && !flags.files) {
-      if (!fs.existsSync(path.join(v.repo.local, ".git"))) die(`${v.repo.local} is gone; lzs pull ${name} --files copies the files instead`);
-      const msg = commitTitle(name, v, flags);
-      const r = remote(v.id, `cd ${q(v.repo.path)} && git add -A && { git diff --cached --quiet || git commit -q -m ${msg}; } && \
+  await syncTranscripts(name, v, cfg, flags);
+  if (v.repo?.kind === "local" && !flags.files) {
+    if (!fs.existsSync(path.join(v.repo.local, ".git"))) die(`${v.repo.local} is gone; lzs pull ${name} --files copies the files instead`);
+    if (!/^[0-9a-f]{40,64}$/.test(v.repo.base) || !NAME_RE.test(name)) die("this session's record is damaged");
+    const r = remote(v.id, `cd ${bv(v.repo.path)} && git add -A && { git diff --cached --quiet || git commit -q --no-verify -m ${commitTitle(name, v, flags)}; } && \
 if [ "$(git rev-list --count ${v.repo.base}..HEAD)" = 0 ]; then echo NOCHANGES; else git bundle create -q /tmp/lzs.bundle ${v.repo.base}..HEAD && echo BUNDLED; fi`);
-      if (/NOCHANGES/.test(r.stdout)) { console.log(`${name}: no changes yet`); return 0; }
-      const bundle = path.join(tmp, "lzs.bundle");
-      lizard(["sandbox", "files", "get", v.id, "/tmp/lzs.bundle", bundle]);
-      const f = spawnSync("git", ["-C", v.repo.local, "fetch", "-q", "--force", bundle, `HEAD:refs/heads/${v.repo.branch}`], { encoding: "utf8" });
-      if (f.status !== 0) die(`git fetch failed: ${f.stderr}`);
-      const g = (...a) => spawnSync("git", ["-C", v.repo.local, ...a], { encoding: "utf8" }).stdout.trim();
-      const stat = g("diff", "--shortstat", `${v.repo.base}...${v.repo.branch}`);
-      const log = g("log", "--oneline", `${v.repo.base}..${v.repo.branch}`);
-      console.log(`${green("✓")} ${bold(v.repo.branch)} in ${v.repo.local}${stat ? dim(` · ${stat}`) : ""}\n${log.split("\n").slice(0, 8).map((l) => dim("  " + l)).join("\n")}\n\n  git diff ${v.repo.base.slice(0, 8)}...${v.repo.branch}\n  git merge ${v.repo.branch}`);
-      return 0;
-    }
-    const dest = path.resolve(flags.to || path.join(CFG_DIR, "pulled", name));
-    fs.mkdirSync(dest, { recursive: true });
-    remote(v.id, `cd / && tar -czf /tmp/lzs-pull.tgz --exclude=node_modules --exclude=.venv workspace $(ls -d root/.claude/projects root/.codex/sessions root/.local/share/opencode 2>/dev/null)`);
-    const tgz = path.join(tmp, "pull.tgz");
-    lizard(["sandbox", "files", "get", v.id, "/tmp/lzs-pull.tgz", tgz]);
-    remote(v.id, "rm -f /tmp/lzs-pull.tgz", { check: false });
-    spawnSync("tar", ["-xzf", tgz, "-C", dest], { stdio: "inherit" });
-    console.log(`${name} → ${dest}`);
+    if (/NOCHANGES/.test(r.stdout)) { console.log(`${name}: no changes yet`); return 0; }
+    const d = mkTmp(), bundle = path.join(d, "lzs.bundle");
+    lizard(["sandbox", "files", "get", v.id, "/tmp/lzs.bundle", bundle]);
+    const f = spawnSync("git", ["-C", v.repo.local, "fetch", "-q", "--force", "--no-tags", "--no-write-fetch-head", bundle, `HEAD:refs/heads/${v.repo.branch}`], { encoding: "utf8" });
+    rmTmp(d);
+    if (f.status !== 0) die(`git fetch failed: ${safeText(f.stderr)}`);
+    const g = (...a) => safeText(spawnSync("git", ["-C", v.repo.local, ...a], { encoding: "utf8" }).stdout.trim());
+    const stat = g("diff", "--shortstat", `${v.repo.base}...${v.repo.branch}`);
+    const log = g("log", "--no-color", "--oneline", `${v.repo.base}..${v.repo.branch}`);
+    console.log(`${green("✓")} ${bold(v.repo.branch)} in ${v.repo.local}${stat ? dim(` · ${stat}`) : ""}\n${log.split("\n").slice(0, 8).map((l) => dim("  " + l)).join("\n")}\n\n  git diff ${v.repo.base.slice(0, 8)}...${v.repo.branch}\n  git merge ${v.repo.branch}`);
     return 0;
-  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  }
+  let dest;
+  if (flags.to) {
+    dest = path.resolve(String(flags.to).replace(/^~(?=\/|$)/, HOME));
+    if (fs.existsSync(dest) && (!fs.statSync(dest).isDirectory() || fs.readdirSync(dest).length)) die(`${dest} is not empty: --files goes into a new or empty directory`);
+  } else {
+    ensureDir(path.join(CFG_DIR, "pulled"));
+    dest = path.join(CFG_DIR, "pulled", `${name}-${new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "").replace("T", "-")}`);
+  }
+  fs.mkdirSync(dest, { recursive: true, mode: 0o700 });
+  remote(v.id, `cd / && tar -czf /tmp/lzs-pull.tgz --exclude=.git --exclude=node_modules --exclude=.venv workspace $(ls -d root/.claude/projects root/.codex/sessions root/.local/share/opencode 2>/dev/null)`);
+  const d = mkTmp(), tgz = path.join(d, "pull.tgz");
+  lizard(["sandbox", "files", "get", v.id, "/tmp/lzs-pull.tgz", tgz]);
+  remote(v.id, "rm -f /tmp/lzs-pull.tgz", { check: false });
+  const st = extractUntrusted(gunzip(tgz), fs.realpathSync(dest));
+  rmTmp(d);
+  console.log(`${name} → ${dest} (${plural(st.files, "file")}${st.skipped ? `; skipped ${st.skipped}: links, .git and other non-files` : ""}; no execute bits)`);
+  if (st.envrc.length) warnLoud(`it contains .envrc files (${st.envrc.slice(0, 5).join(", ")}): direnv would run them if you allow them. Read them first.`);
+  say("transcripts in it (root/.claude, root/.codex) hold whatever the agent saw and wrote, secrets included");
+  return 0;
 }
 
 // What a session changed since it started. With a name: the diff itself (committed, uncommitted
@@ -862,11 +1546,12 @@ async function cmdDiff(ref, flags) {
     if (!v.repo) die(`${name} has no repository`);
     await wake(name, v, liveSandboxes(cfg).get(v.id));
     const color = tty ? "-c color.ui=always" : "";
-    const r = remote(v.id, `cd ${q(v.repo.path)} && export GIT_INDEX_FILE=$(mktemp) && { cp .git/index $GIT_INDEX_FILE 2>/dev/null; git add -A >/dev/null 2>&1; \
+    const r = remote(v.id, `cd ${bv(v.repo.path)} && export GIT_INDEX_FILE=$(mktemp) && { cp .git/index $GIT_INDEX_FILE 2>/dev/null; git add -A >/dev/null 2>&1; \
 git ${color} diff --cached ${flags.stat ? "--stat" : ""} $(cat ${REMOTE}/base); rm -f $GIT_INDEX_FILE; true; }`);
-    if (!r.stdout.trim()) { console.log(`${name}: no changes yet`); return 0; }
-    if (tty && !flags.stat && r.stdout.split("\n").length > (process.stdout.rows || 40)) spawnSync("less", ["-R"], { input: r.stdout, stdio: ["pipe", "inherit", "inherit"] });
-    else process.stdout.write(r.stdout);
+    const out = tty ? safeSgr(r.stdout) : safeText(r.stdout);
+    if (!out.trim()) { console.log(`${name}: no changes yet`); return 0; }
+    if (tty && !flags.stat && out.split("\n").length > (process.stdout.rows || 40)) spawnSync("less", ["-R"], { input: out, stdio: ["pipe", "inherit", "inherit"] });
+    else process.stdout.write(out);
     return 0;
   }
   const all = byAge(sessions()).filter(([, v]) => v.repo);
@@ -874,14 +1559,13 @@ git ${color} diff --cached ${flags.stat ? "--stat" : ""} $(cat ${REMOTE}/base); 
   const entries = flags.all || !lastGroup ? all : all.filter(([, v]) => v.group === lastGroup);
   if (!entries.length) { console.log("no sessions with a repository. Start some with: lzs fan 3 . -p \"…\""); return 0; }
   const rows = await probeAll(entries, liveSandboxes(cfg));
-  // Passing checks first, then the smaller change.
   const rank = (r) => [r.check?.state === "passed" ? 0 : r.check ? 2 : 1, (r.git?.added ?? 0) + (r.git?.removed ?? 0)];
   rows.sort((a, b) => { const x = rank(a), y = rank(b); return x[0] - y[0] || x[1] - y[1]; });
   const w = process.stdout.columns || 120;
   for (const r of rows) {
     const ck = r.check ? (r.check.state === "passed" ? green("✓ passed") : r.check.state === "running" ? cyan("… running") : red("✗ failed")) : dim("no check");
     const g = r.git ? `${green(("+" + r.git.added).padStart(6))} ${red(("−" + r.git.removed).padEnd(6))} ${String(r.git.files).padStart(3)} file${r.git.files === 1 ? " " : "s"}` : dim("     (paused)          ");
-    console.log(`${bold(r.name.padEnd(9))} ${(STATE_COLOR[r.state] ?? ((x) => x))((STATE_LABEL[r.state] ?? r.state).padEnd(11))} ${ck.padEnd(tty ? 17 : 8)} ${g}  ${trunc(r.title || r.v.prompt || "", Math.max(20, w - 62))}`);
+    console.log(`${bold(r.name.padEnd(9))} ${(STATE_COLOR[r.state] ?? ((x) => x))((STATE_LABEL[r.state] ?? r.state).padEnd(11))} ${ck.padEnd(tty ? 17 : 8)} ${g}  ${trunc(r.title || oneLine(r.v.prompt || ""), Math.max(20, w - 62))}`);
   }
   console.log(dim(`\n${bold("lzs diff <name>")} for one diff · ${bold("lzs pick <name>")} to keep it and delete the others`));
   return 0;
@@ -914,14 +1598,13 @@ async function cmdPick(ref, flags) {
     rl.close();
     if (/^n/i.test(a)) return 0;
   } else if (!flags.yes) { say(`other attempts kept (${others.join(", ")}); add --yes to delete them`); return 0; }
-  return cmdRm(others, {});
+  return cmdRm(others, { "no-sync": flags["no-sync"] });
 }
 
-// The session you kept still runs (and bills) until it pauses itself: say so, and how to stop it.
 function stillRunning(name, v, cfg) {
   const st = liveSandboxes(cfg).get(v.id)?.status;
   if (st !== "running") return;
-  const idle = cfg.idleMinutes ?? 30;
+  const idle = v.idleMinutes ?? cfg.idleMinutes ?? 30;
   say(`${name} is still running${idle ? ` (it pauses itself after ${idle} idle min)` : ""}: ${bold(`lzs stop ${name}`)} to pause it now, ${bold(`lzs rm ${name}`)} to delete it`);
 }
 
@@ -936,16 +1619,16 @@ async function cmdCheck(refs, flags) {
     const l = live.get(v.id);
     if (!l) return console.log(`${bold(name.padEnd(9))} ${red("gone")}`);
     await wake(name, v, l);
-    const r = await remoteAsync(v.id, `L=${REMOTE}; [ -f $L/env ] && set -a && . $L/env && set +a
-${cmd ? `printf '%s' ${q(cmd)} > $L/check` : ""}
+    const r = await remoteAsync(v.id, `L=${REMOTE}
+${cmd ? `printf %s ${bv(cmd)} > $L/check` : ""}
 [ -s $L/check ] || { echo NOCHECK; exit 0; }
 echo running > $L/check.rc
 ( cd "$(cat $L/cwd 2>/dev/null || echo /workspace)" && timeout "\${LZS_CHECK_TIMEOUT:-900}" bash -lc "$(cat $L/check)" ) > $L/check.log 2>&1
 rc=$?; echo $rc > $L/check.rc; date +%s > $L/check.at
-echo "RC $rc"; tail -15 $L/check.log`.replace(/\\\$\{/g, "${"), { timeoutMs: 20 * 60000 });
+echo "RC $rc"; tail -15 $L/check.log`, { timeoutMs: 20 * 60000 });
     if (/NOCHECK/.test(r.stdout)) return console.log(`${bold(name.padEnd(9))} ${dim("no check set (lzs check " + name + " --check \"npm test\")")}`);
     const rc = (r.stdout.match(/^RC (\d+)/m) ?? [])[1];
-    const tail = r.stdout.split(/^RC \d+$/m)[1]?.trim() ?? "";
+    const tail = safeText(r.stdout.split(/^RC \d+$/m)[1] ?? "").trim();
     console.log(`${bold(name.padEnd(9))} ${rc === "0" ? green("✓ passed") : red(`✗ failed (exit ${rc ?? "?"})`)}`);
     if (rc !== "0" && tail) console.log(dim(tail.split("\n").slice(-6).map((l) => "    " + l).join("\n")));
   });
@@ -953,77 +1636,100 @@ echo "RC $rc"; tail -15 $L/check.log`.replace(/\\\$\{/g, "${"), { timeoutMs: 20 
   return 0;
 }
 
-// Commit and push the session's branch to GitHub, and open a pull request.
+// Ship the session's branch. A local repo: pull it here (lzs pull) and push it from this machine,
+// with your own git and gh logins, which never enter the sandbox. A --repo session: push from the
+// sandbox with its GitHub grant (or the token you gave it) and open a pull request.
 async function cmdPush(ref, flags) {
   const cfg = needConfig();
   const [name, v] = findSession(ref);
   if (!v.repo) die(`${name} has no repository (start one with lzs . or lzs --repo owner/name)`);
+  if (v.repo.kind === "local") {
+    const code = await cmdPull(name, { ...flags, files: false });
+    if (code !== 0) return code;
+    const p = spawnSync("git", ["-C", v.repo.local, "push", "-u", "origin", `refs/heads/${v.repo.branch}:refs/heads/${v.repo.branch}`], { stdio: "inherit" });
+    if (p.status !== 0) die("git push failed (from this machine, with your own git login)");
+    if (flags.pr !== "no") {
+      const pr = spawnSync("gh", ["pr", "create", "--fill", "--head", v.repo.branch], { cwd: v.repo.local, encoding: "utf8" });
+      if (pr.error?.code === "ENOENT") say("gh is not installed here: open the pull request on GitHub");
+      else console.log(safeText(`${pr.stdout}${pr.stderr}`).trim().split("\n").at(-1));
+    }
+    console.log(`${green("✓")} pushed ${v.repo.branch} from this machine`);
+    return 0;
+  }
   await wake(name, v, liveSandboxes(cfg).get(v.id));
-  const r = remote(v.id, `GH_TOKEN=; [ -f ${REMOTE}/env ] && set -a && . ${REMOTE}/env && set +a
-cd ${q(v.repo.path)} || exit 1
-git add -A; git diff --cached --quiet || git commit -q -m ${commitTitle(name, v, flags)}
-[ -n "$GH_TOKEN" ] || { echo NOGH; exit 0; }
-git remote get-url origin >/dev/null 2>&1 || { echo NOREMOTE; exit 0; }
+  const r = remote(v.id, `cd ${bv(v.repo.path)} || exit 1
+[ -s /etc/lizard/gh/hosts.yml ] && export GH_CONFIG_DIR=/etc/lizard/gh
+[ -s ${REMOTE}/gh-token ] && export GH_TOKEN="$(cat ${REMOTE}/gh-token)"
+git add -A; git diff --cached --quiet || git commit -q --no-verify -m ${commitTitle(name, v, flags)}
+[ -n "\${GH_CONFIG_DIR:-}\${GH_TOKEN:-}" ] || { echo NOGH; exit 0; }
 git push -q -u origin HEAD:refs/heads/${v.repo.branch} 2>&1 || exit 1
 ${flags.pr === "no" ? "" : `gh pr create --fill --head ${v.repo.branch} 2>&1 | tail -1 || true`}`, { check: false });
-  if (/NOGH/.test(r.stdout)) die("this base has no GitHub login: run lzs init --github, or bring the branch here with lzs pull");
-  if (/NOREMOTE/.test(r.stdout)) die("the repository has no origin remote");
+  if (/NOGH/.test(r.stdout)) die("this session has no GitHub access (no grant from Lizard, no --github-token): bring the work here with lzs pull --files, or start the session again with GitHub connected on Lizard");
   if (r.status !== 0) die(`push failed: ${lizardError(r)}`);
-  console.log(`${green("✓")} pushed ${v.repo.branch}${r.stdout.trim() ? `\n${r.stdout.trim()}` : ""}`);
+  console.log(`${green("✓")} pushed ${v.repo.branch}${r.stdout.trim() ? `\n${safeText(r.stdout).trim()}` : ""}`);
   return 0;
 }
 
 // A dev server in the session, on a URL you can open.
 async function cmdOpen(ref, port) {
   needConfig();
-  if (!/^\d+$/.test(port ?? "")) die("usage: lzs open <name> <port>");
+  if (!/^\d{1,5}$/.test(port ?? "")) die("usage: lzs open <name> <port>");
   const [, v] = findSession(ref);
   const r = lizard(["sandbox", "expose", v.id, port], { json: true });
   const url = r.url ?? r.publicUrl ?? r.urls?.[0];
-  if (!url) die(`expose answered without a URL: ${JSON.stringify(r).slice(0, 300)}`);
+  if (!url || !/^https:\/\/[^\s]+$/.test(url)) die(`expose answered without a URL`);
   console.log(url);
   if (tty) spawn(process.platform === "darwin" ? "open" : "xdg-open", [url], { stdio: "ignore", detached: true }).on("error", () => {}).unref();
   return 0;
 }
 
-function cmdStop(refs, flags) {
-  needConfig();
+async function cmdStop(refs, flags) {
+  const cfg = needConfig();
   const targets = flags.all ? byName(sessions()).map(([n]) => n) : refs;
   if (!targets.length) die("usage: lzs stop <name>... | --all");
-  for (const r of targets) {
-    const [name, v] = findSession(r);
-    const res = lizard(["sandbox", "pause", v.id, "--no-wait"], { check: false });
+  const live = liveSandboxes(cfg);
+  await pool(targets.map((r) => findSession(r)), 8, async ([name, v]) => {
+    if (live.get(v.id)?.status === "running") await syncTranscripts(name, v, cfg, flags);
+    const res = await lizardAsync(["sandbox", "pause", v.id, "--no-wait"]);
     say(res.status === 0 ? `pausing ${name}… (files and conversation kept, compute billing stops; lzs resume ${name} wakes it)` : `${name}: could not pause (${lizardError(res)})`);
-  }
+  });
   return 0;
 }
 
-function cmdRm(refs, flags) {
-  needConfig();
+async function cmdRm(refs, flags) {
+  const cfg = needConfig();
   const targets = flags.all ? byName(sessions()).map(([n]) => n) : refs;
   if (!targets.length) die("usage: lzs rm <name>... | --all");
-  for (const r of targets) {
-    const [name, v] = findSession(r);
-    const res = lizard(["sandbox", "rm", v.id], { check: false });
-    if (res.status !== 0 && !/not found/i.test(lizardError(res))) { say(`${name}: could not delete ${v.id} (${lizardError(res)}); kept in lzs ls`); continue; }
+  const live = liveSandboxes(cfg);
+  await pool(targets.map((r) => findSession(r)), 8, async ([name, v]) => {
+    const l = live.get(v.id);
+    // Its conversations first: a paused one is woken for that (without starting the agent).
+    if (l && !flags["no-sync"] && cfg.sync !== false) {
+      try { await wake(name, v, l, { agent: false }); await syncTranscripts(name, v, cfg, flags); } catch {}
+    }
+    const res = await lizardAsync(["sandbox", "rm", v.id, "--yes"], { timeoutMs: 60000 });
+    if (res.status !== 0 && !/not found/i.test(lizardError(res))) { say(`${name}: could not delete ${v.id} (${lizardError(res)}); kept in lzs ls`); return; }
     updateSessions((all) => { delete all[name]; });
+    recordCreated("sandboxes", v.id, false);
     say(`${name} deleted`);
-  }
-  if (flags.all) say(`your base snapshot and lzs's API key stay, for the next session; ${bold("lzs uninstall")} removes those too`);
+  });
+  gcOld();
+  if (flags.all) say(`your base snapshot stays, for the next session; ${bold("lzs uninstall")} removes it too`);
   return 0;
 }
 
 // Everything lzs made on Lizard, by the ids it recorded here (never by name: other machines and
-// other people may have their own lzs-base / lzs-<project> in the same project), then its local state.
+// other people may have their own lzs-base in the same project), then its local state.
 async function cmdUninstall(flags) {
   const cfg = config() ?? {};
-  const made = readJson(CREATED_FILE, {});
+  const made = created();
   const sess = byName(sessions());
   const sandboxes = [...new Set([...sess.map(([, v]) => v.id), ...(made.sandboxes ?? [])])].filter(Boolean);
   const snapshots = [...new Set([cfg.snapshot, ...(made.snapshots ?? [])])].filter(Boolean);
   const keys = [...new Set([cfg.keyId, ...(made.keys ?? [])])].filter(Boolean);
+  const projects = made.projects ?? [];
   if (!sandboxes.length && !snapshots.length && !keys.length && !fs.existsSync(CFG_DIR)) { console.log("nothing to remove: lzs has nothing set up here"); return 0; }
-  console.error(`lzs uninstall removes, on Lizard:\n  ${plural(sess.length, "session")}${sess.length ? ` (${sess.map(([n]) => n).join(", ")})` : ""}${sandboxes.length > sess.length ? ` + ${plural(sandboxes.length - sess.length, "leftover sandbox", "leftover sandboxes")}` : ""}\n  ${plural(snapshots.length, "base snapshot")}${snapshots.length ? ` (${snapshots.join(", ")})` : ""}\n  ${plural(keys.length, "API key")}${keys.length ? ` (${keys.join(", ")})` : ""}\nand here: ${CFG_DIR}`);
+  console.error(`lzs uninstall removes, on Lizard:\n  ${plural(sess.length, "session")}${sess.length ? ` (${sess.map(([n]) => n).join(", ")})` : ""}${sandboxes.length > sess.length ? ` + ${plural(sandboxes.length - sess.length, "leftover sandbox", "leftover sandboxes")}` : ""}\n  ${plural(snapshots.length, "base snapshot")}${snapshots.length ? ` (${snapshots.join(", ")})` : ""}\n  ${plural(keys.length, "API key")}${keys.length ? ` (${keys.join(", ")})` : ""}\nand here: ${CFG_DIR}${projects.length ? `\nIt keeps the project${projects.length > 1 ? "s" : ""} lzs init --new-project made (${projects.join(", ")}): lizard project delete <id>` : ""}`);
   if (!flags.yes) {
     if (!interactive()) die("add --yes to remove all of this");
     const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
@@ -1034,7 +1740,7 @@ async function cmdUninstall(flags) {
   const gone = (r) => r.status === 0 || /not found/i.test(lizardError(r));
   const failed = [];
   await pool(sandboxes, 10, async (id) => {
-    const r = await lizardAsync(["sandbox", "rm", id], { timeoutMs: 60000 });
+    const r = await lizardAsync(["sandbox", "rm", id, "--yes"], { timeoutMs: 60000 });
     if (gone(r)) { updateSessions((all) => { for (const [n, v] of Object.entries(all)) if (v.id === id) delete all[n]; }); recordCreated("sandboxes", id, false); }
     else failed.push(`sandbox ${id}: ${lizardError(r)}`);
   });
@@ -1060,9 +1766,9 @@ async function cmdGroup(rest, flags) {
   const repo = repoFromArgs(rest.slice(1), flags);
   const names = nextNames(count);
   const env = process.env.LZS_HOME ? `LZS_HOME=${q(process.env.LZS_HOME)} ` : "";
-  const extra = [repo?.kind === "local" ? q(repo.dir) : "", repo?.kind === "github" ? `--repo ${q(repo.slug)}` : "", flags.agent ? `--agent ${q(flags.agent)}` : "", flags.prompt ? `--prompt ${q(flags.prompt)}` : ""].join(" ");
+  const extra = [repo?.kind === "local" ? q(repo.dir) : "", repo?.kind === "github" ? `--repo ${q(repo.slug)}` : "", flags.agent ? `--agent ${q(flags.agent)}` : "", flags.prompt ? `--prompt ${q(flags.prompt)}` : "", "--yes"].join(" ");
   for (const name of names.slice(1)) {
-    spawnSync("tmux", ["split-window", "-d", `${env}${q(process.execPath)} ${q(process.argv[1])} new ${extra} --name ${name}; printf 'session ended, Enter to close'; read _`], { stdio: "inherit" });
+    spawnSync("tmux", ["split-window", "-d", `${env}${q(process.execPath)} ${q(process.argv[1])} new ${extra} --name ${q(name)}; printf 'session ended, Enter to close'; read _`], { stdio: "inherit" });
     spawnSync("tmux", ["select-layout", "tiled"], { stdio: "ignore" });
   }
   return cmdNew(rest.slice(1), { ...flags, name: names[0] });
@@ -1072,15 +1778,16 @@ function help() {
   console.log(`${bold("lzs")} ${VERSION}: coding agents in Lizard sandboxes, one command per session
 
 ${bold("Start")}
-  lzs init [--agent claude|codex|opencode] [--size nano|mini|small] [--github]
-           [--notify URL] [--idle-minutes 30] [--project P]  build your base snapshot (once); URL =
-                                                             ntfy/Slack/Discord/Telegram, pinged
-                                                             when an agent finishes, laptop closed
+  lzs init --new-project | --project P                       build your base snapshot (once; again =
+           [--agent claude|codex|opencode] [--agents LIST]   rotate). --new-project: a project for
+           [--size nano|mini|small] [--notify URL]           lzs alone (recommended). URL = ntfy/
+           [--idle-minutes 30] [--max-hours 24] [--no-local]  Slack/Discord/Telegram, pinged when an
+           [--include-mcp-secrets] [--no-sync]               agent finishes, laptop closed
   lzs [. | DIR | --repo owner/name] [-p "task"] [-d]         a fresh session (. = this repo); -d (or
-                                                             no terminal): start it, don't attach
+      [--include-secrets] [--yes] [--max-hours H]            no terminal): start it, don't attach
   lzs fan N [. | DIR | --repo owner/name] -p "task" [--check CMD]
-                                                             N agents on one task, in the background;
-                                                             CMD (your tests) runs in each when done
+                                                             N agents on one task (max ${FAN_MAX}; asks
+                                                             above ${FAN_CONFIRM}); CMD runs in each when done
   lzs group N [.] [-p "task"]                                N sessions side by side (inside tmux)
 
 ${bold("Follow")}
@@ -1091,28 +1798,31 @@ ${bold("Follow")}
   lzs resume [name]                                          attach (wakes a paused one in ~2.5 s)
 
 ${bold("Compare")}
-  lzs diff                                                   the last fan-out side by side: check,
-                                                             size of change, what each agent did
+  lzs diff                                                   the last fan-out side by side
   lzs diff <name> [--stat]                                   one session's diff
   lzs check [name...] [--check CMD]                          run the check now, everywhere at once
   lzs pick <name> [--yes] [--keep]                           keep it (as a branch), delete the rest
-                                                             (--yes: no question; --keep: keep the
-                                                             rest; one with no changes needs --force)
 
 ${bold("Ship")}
   lzs pull <name> [--files] [--to DIR]                       the work as branch lzs/<name> in your repo
-                                                             (--files: copy /workspace to DIR)
+                                                             (--files: /workspace into a new directory,
+                                                             no .git, no execute bits)
   lzs push <name>                                            push that branch and open a pull request
   lzs open <name> <port>                                     a URL for a dev server in the session
 
 ${bold("Tidy")}
   lzs stop <name> | --all                                    pause now (files kept, billing stops)
-  lzs rm <name> | --all                                      delete
-  lzs uninstall [--yes]                                      delete every session, the base snapshot
-                                                             and lzs's API key, and ~/.config/lzs
+  lzs rm <name> | --all                                      delete (transcripts come back first)
+  lzs uninstall [--yes]                                      delete everything lzs made, by id
 
+GitHub: a --repo session gets a grant for that one repository from Lizard (GitHub connected on
+Lizard); --github-token / LZS_GH_TOKEN gives a session a token of yours instead (the agent can read
+it: make it fine-grained, one repository). A local repo is pushed from this machine (lzs push).
+Transcripts come back to ~/.claude/projects and ~/.codex/sessions on pull, stop, rm and pick
+(--no-sync: not). Agents run with --dangerously-skip-permissions (Claude Code) or
+--dangerously-bypass-approvals-and-sandbox (Codex): see "Security model" in the README.
 Inside a session: Ctrl-b d detaches (the agent keeps going), Ctrl-b c opens a shell next to it.
-Idle sessions pause themselves after 30 minutes. Needs: npm i -g @lizard-build/cli && lizard login`);
+Needs: npm i -g @lizard-build/cli && lizard login`);
 }
 
 // ---------- main ----------
@@ -1123,6 +1833,7 @@ const { flags, rest, pass } = parse(sub ? argv.slice(1) : argv);
 if (pass.length && !flags.prompt) flags.prompt = pass.join(" ");
 if (flags.version || flags.v) { console.log(VERSION); process.exit(0); }
 if (flags.help || flags.h || sub === "help") { help(); process.exit(0); }
+if (process.env.LIZARD_API_URL) lizardApiBase(); // refuse a non-https API before anything uses it
 
 let code = 0;
 switch (sub) {
@@ -1141,8 +1852,8 @@ switch (sub) {
   case "check": code = await cmdCheck(rest, flags); break;
   case "push": code = await cmdPush(rest[0], flags); break;
   case "open": code = await cmdOpen(rest[0], rest[1]); break;
-  case "stop": case "pause": code = cmdStop(rest, flags); break;
-  case "rm": case "delete": code = cmdRm(rest, flags); break;
+  case "stop": case "pause": code = await cmdStop(rest, flags); break;
+  case "rm": case "delete": code = await cmdRm(rest, flags); break;
   case "uninstall": case "reset": code = await cmdUninstall(flags); break;
 }
 process.exit(code ?? 0);
